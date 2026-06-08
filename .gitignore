@@ -1,0 +1,4 @@
+build-win/
+build/
+build-linux/
+*.bak
