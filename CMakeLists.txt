@@ -57,8 +57,9 @@ if(WIFIDRIVER_WITH_WFB)
         PREINCLUDE_FILE=<${CMAKE_CURRENT_SOURCE_DIR}/wfb/wfb_log.h>
         ZFEX_UNROLL_ADDMUL_SIMD=8 ZFEX_INLINE_ADDMUL ZFEX_INLINE_ADDMUL_SIMD)
 
+    # wfb LOGIC only (RX/TX/FEC + signal quality). The JNI bridge (WfbngLink) lives in devourer.
     add_library(WiFiDriverWfb STATIC
-        wfb/RxFrame.cpp wfb/TxFrame.cpp wfb/SignalQualityCalculator.cpp wfb/WfbngLink.cpp)
+        wfb/RxFrame.cpp wfb/TxFrame.cpp wfb/SignalQualityCalculator.cpp)
     target_include_directories(WiFiDriverWfb PUBLIC wfb)
     target_compile_features(WiFiDriverWfb PUBLIC cxx_std_20)
     target_link_libraries(WiFiDriverWfb PUBLIC WiFiDriver wfb-ng)
