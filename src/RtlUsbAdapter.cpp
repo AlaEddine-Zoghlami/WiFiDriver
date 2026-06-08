@@ -71,6 +71,22 @@ RtlUsbAdapter::RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger)
     _logger->info("USB device {:04x}:{:04x}", _idVendor, _idProduct);
   }
 
+  // Robust device-state reset on open: a prior process (AP mode, or a station run killed
+  // mid-connect) can leave the chip's USB engine / TX path in a state that a firmware
+  // re-download does NOT clear — seen as bulk-OUT TX timeouts (status=2, len=0). A USB port
+  // reset re-enumerates the device to a clean state, so the connect always starts known-good.
+  // (Android: a reset on a wrapped sys-device fd can revoke the fd, so it is opt-in there.)
+  bool doReset =
+#ifdef __ANDROID__
+      std::getenv("DEVOURER_USB_RESET") != nullptr;
+#else
+      std::getenv("DEVOURER_SKIP_USB_RESET") == nullptr;
+#endif
+  if (doReset) {
+    int rr = libusb_reset_device(_dev_handle);
+    _logger->info("libusb_reset_device rc={}", rr);
+  }
+
   InitDvObj();
 
   if (usbSpeed > LIBUSB_SPEED_HIGH) // USB 3.0
