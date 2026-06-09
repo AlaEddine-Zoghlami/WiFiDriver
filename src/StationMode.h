@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <mutex>
 #include "RtlUsbAdapter.h"
 #include "RadioManagementModule.h"
 #include "ScanProbe.h"
@@ -40,6 +41,7 @@ private:
     uint32_t _pairwise = 0x000FAC04, _group = 0x000FAC04;   // default CCMP
     int _pmf = 0;                                           // 802.11w mode (RSN caps)
     std::string _scanSsid; ApInfo _scanResult;
+    std::mutex  _scanMtx;   // guards _scanSsid + _scanResult: onScanFrame (RX thread) vs scanForSsid (scan thread)
     std::atomic<bool> _gotAuthResp{false}, _gotAssocOk{false}, _gotDeauth{false};
     // The self MAC + AP BSSID we are joining. onMgmtFrame MUST match a1==self && a2==bssid
     // before believing an auth/assoc-resp — otherwise overheard frames from OTHER stations

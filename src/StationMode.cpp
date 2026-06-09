@@ -444,15 +444,22 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
 
 // ---- beacon scan: discover BSSID + channel + RSN (security/discovery parity) -
 void StationMode::onScanFrame(const uint8_t* frame, size_t len) {
+    // RX thread. _scanSsid/_scanResult are also touched by scanForSsid on the scan
+    // thread — snapshot the SSID under the lock (a torn std::string read during a
+    // concurrent reassign crashes parseBeacon's compare), parse off-lock, then
+    // update the result under the lock.
+    std::string ssid;
+    { std::lock_guard<std::mutex> lk(_scanMtx); ssid = _scanSsid; }
     ApInfo info;
-    if (ScanProbe::parseBeacon(frame, len, _scanSsid, info)) {
+    if (ScanProbe::parseBeacon(frame, len, ssid, info)) {
+        std::lock_guard<std::mutex> lk(_scanMtx);
         if (!_scanResult.found || info.rssi > _scanResult.rssi) _scanResult = info;
     }
 }
 
 ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChannelMs) {
     using namespace std::chrono;
-    _scanSsid = ssid; _scanResult = ApInfo{};
+    { std::lock_guard<std::mutex> lk(_scanMtx); _scanSsid = ssid; _scanResult = ApInfo{}; }
     // Order = likelihood for a LEGAL APFPV link first, then catch-all:
     //   1) hint (the configured/last APFPV channel)
     //   2) 5.2 GHz UNII-1 (36/40/44/48) — the legal DE 200 mW @ 20 MHz APFPV band
@@ -466,7 +473,7 @@ ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChanne
                        149, 153, 157, 161, 165 };      // UNII-3
     for (int ch : channels) {
         if (ch <= 0) continue;
-        _scanResult = ApInfo{};   // reset per channel — don't carry a bleed match over
+        { std::lock_guard<std::mutex> lk(_scanMtx); _scanResult = ApInfo{}; }   // reset per channel — don't carry a bleed match over
         _rm.set_channel_bwmode((uint8_t)ch, 0, CHANNEL_WIDTH_20);  // tune radio (devourer API)
         auto t0 = steady_clock::now();
         while (steady_clock::now() - t0 < milliseconds(perChannelMs)) {
@@ -474,13 +481,16 @@ ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChanne
             // channel must equal the tuned channel. This rejects 2.4GHz adjacent-
             // channel bleed (hearing a ch6 AP while tuned to ch1) that otherwise
             // returns the WRONG channel -> we arm off-channel -> auth never ACKs.
-            if (_scanResult.found && (_scanResult.channel == ch || _scanResult.channel == 0)) {
-                _scanResult.channel = ch; return _scanResult;
+            {
+                std::lock_guard<std::mutex> lk(_scanMtx);
+                if (_scanResult.found && (_scanResult.channel == ch || _scanResult.channel == 0)) {
+                    _scanResult.channel = ch; return _scanResult;
+                }
             }
             std::this_thread::sleep_for(milliseconds(20));
         }
     }
-    return _scanResult;   // .found == false if not seen
+    { std::lock_guard<std::mutex> lk(_scanMtx); return _scanResult; }   // .found == false if not seen
 }
 
 } // namespace apfpv

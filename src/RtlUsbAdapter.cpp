@@ -732,8 +732,16 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
   st->buffers.resize(numUrbs);
   st->transfers.reserve(numUrbs);
   st->submitted.reserve(numUrbs);
+  // RX URB buffer size. 16K was too small: the RTL8812AU's USB-RX aggregation can pack
+  // several MPDUs into one bulk-IN transfer, and on some USB host controllers (notably
+  // MediaTek phones) an oversized transfer OVERFLOWS the URB and STALLs the bulk-IN
+  // endpoint. apfpv_async_rx_cb then blindly resubmits into the halted EP (no clear_halt),
+  // so RX dies — trickle/black-screen at full RTP rate while the sparse connect frames
+  // still worked. 64K holds the max aggregate so it never overflows. Tunable for testing.
+  size_t rxBufBytes = 64 * 1024;
+  if (const char *e = std::getenv("DEVOURER_RX_BUFK")) rxBufBytes = (size_t)std::atoi(e) * 1024;
   for (int i = 0; i < numUrbs; ++i) {
-    st->buffers[i].resize(16 * 1024);
+    st->buffers[i].resize(rxBufBytes);
     libusb_transfer *t = libusb_alloc_transfer(0);
     libusb_fill_bulk_transfer(t, _dev_handle, _bulk_in_ep, st->buffers[i].data(),
                               (int)st->buffers[i].size(), apfpv_async_rx_cb,

@@ -137,13 +137,10 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   do {
     auto pattrib = rtl8812_query_rx_desc_status(pbuf.data());
 
-    if ((pattrib.crc_err) || (pattrib.icv_err)) {
-      _logger->info("RX Warning! crc_err={} "
-                    "icv_err={}, skip!",
-                    pattrib.crc_err, pattrib.icv_err);
-      break;
-    }
-
+    // NOTE: CRC/ICV-bad frames are skipped PER-FRAME below — NOT break'd. The chip packs
+    // many 802.11 MPDUs into one bulk-IN transfer (USB_AGG_PKTNUM); break'ing on the first
+    // bad frame discarded it AND every good frame packed after it in the same transfer ->
+    // partial video frames / tearing, worse at higher rate (more MPDUs per aggregate).
     auto pkt_offset = RXDESC_SIZE + pattrib.drvinfo_sz + pattrib.shift_sz +
                       pattrib.pkt_len; // this is offset for next package
 
@@ -169,7 +166,9 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     // recvframe_put(precvframe, pattrib.pkt_len);
     /* recvframe_pull(precvframe, drvinfo_sz + RXDESC_SIZE); */
 
-    if (pattrib.pkt_rpt_type ==
+    if (pattrib.crc_err || pattrib.icv_err) {
+      // Bad frame: skip ITS payload but keep walking the aggregate (do not break).
+    } else if (pattrib.pkt_rpt_type ==
         RX_PACKET_TYPE::NORMAL_RX) /* Normal rx packet */
     {
       ret.push_back({pattrib, pbuf.subspan(pattrib.shift_sz +
