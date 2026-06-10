@@ -34,12 +34,15 @@ public:
     void sendStationH2C(uint8_t macid, const MacAddr& bssid);
     // Post-assoc transition: MSR->STATION + connected H2C (kernel order).
     void becomeStation(const MacAddr& bssid);
+    // Connect-time channel width (20/40); default 20 MHz (legal DE). Fed from ApfpvStation::Params.
+    void setConnectWidth(ChannelWidth_t w) { _connectWidth = w; }
 private:
     std::function<void(int)> _onPhase;
     RtlUsbAdapter& _dev; RadioManagementModule& _rm; SendFrameFn _send;
     bool _armed = false;
     uint32_t _pairwise = 0x000FAC04, _group = 0x000FAC04;   // default CCMP
     int _pmf = 0;                                           // 802.11w mode (RSN caps)
+    ChannelWidth_t _connectWidth = CHANNEL_WIDTH_20;        // connect-time bandwidth (20/40), settable
     std::string _scanSsid; ApInfo _scanResult;
     std::mutex  _scanMtx;   // guards _scanSsid + _scanResult: onScanFrame (RX thread) vs scanForSsid (scan thread)
     std::atomic<bool> _gotAuthResp{false}, _gotAssocOk{false}, _gotDeauth{false};

@@ -51,7 +51,7 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
         // RX daemon -> corrupted filter -> auth-response dropped. Whole-arm serialization
         // measured 3/5 vs 1/5 (DEVOURER_NO_PAUSE_CAL disables the runProbe-level pause).
         _rm.ArmIQKOnNextChannelSet();
-        _rm.set_channel_bwmode(_rm.current_channel(), 0, CHANNEL_WIDTH_20);
+        _rm.set_channel_bwmode(_rm.current_channel(), 0, _connectWidth);   // 20 (legal DE) or 40, set via setConnectWidth
     }
     // (1) own MAC -> REG_MACID
     for (int i = 0; i < 4; ++i) _dev.rtw_write8(REG_MACID + i, self.b[i]);
