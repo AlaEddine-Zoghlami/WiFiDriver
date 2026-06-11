@@ -30,6 +30,7 @@ namespace apfpv {
 static constexpr uint8_t HW_STATE_STATION = 0x02;   // MSR_INFRA
 static constexpr int     TXDESC_8812      = 40;
 
+StationMode::~StationMode() { _alive.store(false); }
 StationMode::StationMode(RtlUsbAdapter& dev, RadioManagementModule& rm, SendFrameFn send)
     : _dev(dev), _rm(rm), _send(std::move(send)) {}
 

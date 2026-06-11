@@ -1,5 +1,4 @@
-// Self-contained AES-128 + CCM (CCMP: M=8, L=2). Software AES with key cache.
-// Multi-core workers in RtlUsbAdapter handle the throughput.
+// Self-contained AES-128 + CCM (CCMP: M=8, L=2). Public-domain style AES core.
 #include "AesCcm.h"
 #include <cstring>
 namespace apfpv { namespace crypto {
@@ -22,7 +21,7 @@ static const uint8_t S[256]={
 0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
 0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16};
 static uint8_t xt(uint8_t x){ return (x<<1)^((x>>7)*0x1b); }
-static void aes_key_impl(Aes& a,const uint8_t k[16]){
+static void aes_key(Aes& a,const uint8_t k[16]){
     memcpy(a.rk,k,16); uint8_t rc=1;
     for(int i=16;i<176;i+=4){
         uint8_t t[4]; memcpy(t,a.rk+i-4,4);
@@ -30,70 +29,6 @@ static void aes_key_impl(Aes& a,const uint8_t k[16]){
         for(int j=0;j<4;j++) a.rk[i+j]=a.rk[i-16+j]^t[j];
     }
 }
-#if defined(__aarch64__)
-// ARMv8 Crypto Extensions AES-128 encrypt — 20 cycles vs 1500 for SW.
-// Uses raw round keys (no pre-MixColumns). Separate key expansion below.
-struct AesCe { uint8_t rk[176]; };
-static void aes_ce_key_expand(const uint8_t k[16], AesCe& ce) {
-    uint8_t *rk = ce.rk;
-    memcpy(rk, k, 16);   // round 0 key = raw key
-    // Use AESE/AESMC to expand subsequent rounds with correct format
-    for (int r = 1; r <= 10; r++) {
-        uint8_t prev[16]; memcpy(prev, rk + (r-1)*16, 16);
-        // SubWord(RotWord) of last word
-        uint8_t tmp[4]; tmp[0] = S[prev[13]]; tmp[1] = S[prev[14]];
-        tmp[2] = S[prev[15]]; tmp[3] = S[prev[12]];
-        static const uint8_t Rcon[11]={0,1,2,4,8,0x10,0x20,0x40,0x80,0x1b,0x36};
-        tmp[0] ^= Rcon[r];  // Rcon — only first byte XOR'd with round constant
-        for (int i = 0; i < 4; i++) rk[r*16 + i] = rk[(r-1)*16 + i] ^ tmp[i];
-        for (int i = 4; i < 16; i++) rk[r*16 + i] = rk[(r-1)*16 + i] ^ rk[r*16 + i-4];
-    }
-}
-static void aes_enc_ce(const AesCe& ce, const uint8_t in[16], uint8_t out[16]) {
-    const uint8_t *rk = ce.rk;
-    __asm__ __volatile__(
-        ".arch_extension crypto\n\t"
-        "ld1 {v0.16b}, [%[in]]\n\t"
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r0
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r1
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r2
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r3
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r4
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r5
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r6
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r7
-        "ld1 {v1.16b}, [%[pk]], #16\n\t"
-        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"  // r8
-        "ld1 {v1.16b}, [%[pk]]\n\t"                            // r9 (no MixColumns)
-        "aese v0.16b, v1.16b\n\t"
-        "st1 {v0.16b}, [%[out]]\n\t"
-        : [pk] "+r"(rk)
-        : [in] "r"(in), [out] "r"(out)
-        : "v0","v1","v16","cc","memory"
-    );
-}
-// Cache: CCMP key bytes → expanded CE keys, TLS per worker thread
-static bool ce_cached(const uint8_t key[16], AesCe& ce) {
-    static thread_local uint8_t ck[16] = {};
-    static thread_local AesCe cache;
-    static thread_local bool valid = false;
-    if (!valid || memcmp(ck, key, 16) != 0) {
-        aes_ce_key_expand(key, cache);
-        memcpy(ck, key, 16); valid = true;
-    }
-    ce = cache;
-    return true;
-}
-#endif // __aarch64__
-
 static void aes_enc(const Aes& a,const uint8_t in[16],uint8_t out[16]){
     uint8_t s[16]; memcpy(s,in,16); for(int i=0;i<16;i++)s[i]^=a.rk[i];
     for(int r=1;r<10;r++){
@@ -128,9 +63,11 @@ static void ccm_core(const Aes& a,const uint8_t* nonce,size_t nlen,
     uint8_t X[16]; aes_enc(a,B,X);
     if(aadlen>0){ uint8_t hdr[16]={0}; size_t o=0; hdr[0]=aadlen>>8;hdr[1]=aadlen&0xff;o=2;
         size_t i=0; while(i<aadlen){ while(o<16&&i<aadlen)hdr[o++]=aad[i++]; for(int j=0;j<16;j++)X[j]^=hdr[j]; aes_enc(a,X,X); o=0; memset(hdr,0,16);} }
+    // payload into MAC
     { size_t i=0; uint8_t blk[16];
       while(i<inlen){ size_t k=inlen-i<16?inlen-i:16; memset(blk,0,16); memcpy(blk,in+i,k);
           for(int j=0;j<16;j++)X[j]^=blk[j]; aes_enc(a,X,X); i+=k; } }
+    // CTR
     uint8_t A[16]={0}; A[0]=L-1; memcpy(A+1,nonce,nlen); A[14]=0;A[15]=0;
     uint8_t S0[16]; aes_enc(a,A,S0);
     for(int i=0;i<8;i++) mic[i]=X[i]^S0[i];
@@ -141,124 +78,197 @@ static void ccm_core(const Aes& a,const uint8_t* nonce,size_t nlen,
 }
 void aes_ccm_encrypt(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
                      const uint8_t* aad,size_t aadlen,const uint8_t* pt,size_t ptlen,uint8_t* out){
-    Aes a; aes_key_impl(a,key); uint8_t mic[8];
+    Aes a; aes_key(a,key); uint8_t mic[8];
     ccm_core(a,nonce,nlen,aad,aadlen,pt,ptlen,out,mic,true);
     memcpy(out+ptlen,mic,8);
 }
-void aes_key_expand(const uint8_t key[16], Aes& a) { aes_key_impl(a, key); }
-
+bool aes_ccm_decrypt(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
+                     const uint8_t* aad,size_t aadlen,const uint8_t* ct,size_t ctlen,uint8_t* out){
+    if(ctlen<8) return false; size_t ptlen=ctlen-8;
+    Aes a; aes_key(a,key);
+    // decrypt: CTR first to recover plaintext, then MAC-verify
+    uint8_t A[16]={0}; A[0]=1; memcpy(A+1,nonce,nlen);
+    uint16_t ctr=1; size_t i=0;
+    while(i<ptlen){ A[14]=ctr>>8;A[15]=ctr&0xff; uint8_t Sx[16]; aes_enc(a,A,Sx);
+        size_t k=ptlen-i<16?ptlen-i:16; for(size_t j=0;j<k;j++) out[i+j]=ct[i+j]^Sx[j]; i+=k; ctr++; }
+    uint8_t mic[8],calc[16]; (void)calc;
+    uint8_t tmp[2048]; if(ptlen>sizeof(tmp)) return false;
+    ccm_core(a,nonce,nlen,aad,aadlen,out,ptlen,tmp,mic,false);
+    return memcmp(mic,ct+ptlen,8)==0;
+}
+// AES key cache support: export expanded key + cached-decrypt overload
+void aes_key_expand(const uint8_t key[16], Aes& a) { aes_key(a, key); }
 bool aes_ccm_decrypt(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
                      const uint8_t* aad,size_t aadlen,const uint8_t* ct,size_t ctlen,uint8_t* out,
                      const Aes* aes_cache){
     if(ctlen<8) return false; size_t ptlen=ctlen-8;
-#if defined(__aarch64__)
-    // ARM-CE fast path: cache CE keys per worker thread (75x faster than SW)
-    AesCe ce;
-    if (ce_cached(key, ce)) {
-        uint8_t A[16]={0}; A[0]=1; memcpy(A+1,nonce,nlen);
-        uint16_t ctr=1; size_t i=0;
-        while(i<ptlen){ A[14]=ctr>>8;A[15]=ctr&0xff; uint8_t Sx[16]; aes_enc_ce(ce,A,Sx);
-            size_t k=ptlen-i<16?ptlen-i:16; for(size_t j=0;j<k;j++) out[i+j]=ct[i+j]^Sx[j]; i+=k; ctr++; }
-        // Build MAC with CE
-        uint8_t mic[8],tmp[2048]; if(ptlen>sizeof(tmp)) return false;
-        uint8_t L=2,B[16]={0}; B[0]=(uint8_t)((aadlen>0?0x40:0)|(((8-2)/2)<<3)|(L-1));
-        memcpy(B+1,nonce,nlen); B[14]=ptlen>>8;B[15]=ptlen&0xff;
-        uint8_t X[16]; aes_enc_ce(ce,B,X);
-        if(aadlen>0){ uint8_t hdr[16]={0}; size_t o=0; hdr[0]=aadlen>>8;hdr[1]=aadlen&0xff;o=2;
-            size_t j=0; while(j<aadlen){ while(o<16&&j<aadlen)hdr[o++]=aad[j++];
-                for(int v=0;v<16;v++)X[v]^=hdr[v]; aes_enc_ce(ce,X,X); o=0; memset(hdr,0,16);} }
-        { size_t j=0; uint8_t blk[16];
-          while(j<ptlen){ size_t k=ptlen-j<16?ptlen-j:16; memset(blk,0,16); memcpy(blk,out+j,k);
-              for(int v=0;v<16;v++)X[v]^=blk[v]; aes_enc_ce(ce,X,X); j+=k; } }
-        uint8_t NA[16]={0}; NA[0]=L-1; memcpy(NA+1,nonce,nlen);
-        uint8_t S0[16]; aes_enc_ce(ce,NA,S0);
-        uint8_t emic[8]; for(int v=0;v<8;v++) emic[v]=X[v]^S0[v];
-        return memcmp(emic,ct+ptlen,8)==0;
-    }
-    // Fall through to SW AES
-#endif
-    Aes local_aes; const Aes* a_ptr = aes_cache;
-    if (!a_ptr) { aes_key_impl(local_aes, key); a_ptr = &local_aes; }
+    const Aes* a = aes_cache;
+    Aes local; if(!a){ aes_key(local,key); a=&local; }
     uint8_t A[16]={0}; A[0]=1; memcpy(A+1,nonce,nlen);
     uint16_t ctr=1; size_t i=0;
-    while(i<ptlen){ A[14]=ctr>>8;A[15]=ctr&0xff; uint8_t Sx[16]; aes_enc(*a_ptr,A,Sx);
+    while(i<ptlen){ A[14]=ctr>>8;A[15]=ctr&0xff; uint8_t Sx[16]; aes_enc(*a,A,Sx);
         size_t k=ptlen-i<16?ptlen-i:16; for(size_t j=0;j<k;j++) out[i+j]=ct[i+j]^Sx[j]; i+=k; ctr++; }
     uint8_t mic[8],tmp[2048]; if(ptlen>sizeof(tmp)) return false;
-    ccm_core(*a_ptr,nonce,nlen,aad,aadlen,out,ptlen,tmp,mic,false);
+    ccm_core(*a,nonce,nlen,aad,aadlen,out,ptlen,tmp,mic,false);
     return memcmp(mic,ct+ptlen,8)==0;
 }
-bool aes_ccm_decrypt(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
-                     const uint8_t* aad,size_t aadlen,const uint8_t* ct,size_t ctlen,uint8_t* out){
-    return aes_ccm_decrypt(key,nonce,nlen,aad,aadlen,ct,ctlen,out,nullptr);
+
+#if defined(__aarch64__)
+// ARM-CE accelerated decrypt — data RX only (NOT handshake).
+// Uses inline ASM AESE/AESMC. Separate from SW AES above so the
+// EAPOL/4-way handshake always uses the proven SW implementation.
+struct AesCeKey { uint8_t rk[176]; };
+static void aes_ce_expand(const uint8_t k[16], AesCeKey& ce){
+    static const uint8_t Rcon[11]={0,1,2,4,8,0x10,0x20,0x40,0x80,0x1b,0x36};
+    uint8_t* rk=ce.rk; memcpy(rk,k,16);
+    for(int r=1;r<=10;r++){
+        uint8_t prev[16]; memcpy(prev,rk+(r-1)*16,16);
+        uint8_t tmp[4]; tmp[0]=S[prev[13]]; tmp[1]=S[prev[14]]; tmp[2]=S[prev[15]]; tmp[3]=S[prev[12]];
+        tmp[0]^=Rcon[r];
+        for(int i=0;i<4;i++) rk[r*16+i]=rk[(r-1)*16+i]^tmp[i];
+        for(int i=4;i<16;i++) rk[r*16+i]=rk[(r-1)*16+i]^rk[r*16+i-4];
+    }
 }
+static void aes_enc_ce(const AesCeKey& ce,const uint8_t in[16],uint8_t out[16]){
+    const uint8_t* rk=ce.rk;
+    __asm__ __volatile__(
+        ".arch_extension crypto\n\t"
+        "ld1 {v0.16b}, [%[in]]\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]]\n\t"
+        "aese v0.16b, v1.16b\n\t"
+        "st1 {v0.16b}, [%[out]]\n\t"
+        : [pk] "+r"(rk)
+        : [in] "r"(in), [out] "r"(out)
+        : "v0","v1","v16","cc","memory"
+    );
+}
+// Data RX only: try ARM-CE decrypt. Returns false to fall back to SW.
+bool aes_ccm_decrypt_ce(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
+                        const uint8_t* aad,size_t aadlen,
+                        const uint8_t* ct,size_t ctlen,uint8_t* out){
+    if(ctlen<8) return false;
+    // TLS cache per worker thread
+    static thread_local uint8_t ck[16]={}; static thread_local AesCeKey ce; static thread_local bool ok=false;
+    if(!ok||memcmp(ck,key,16)!=0){ aes_ce_expand(key,ce); memcpy(ck,key,16); ok=true; }
+    size_t ptlen=ctlen-8;
+    // CTR decrypt
+    uint8_t A[16]={0}; A[0]=1; memcpy(A+1,nonce,nlen);
+    uint16_t ctr=1; size_t i=0;
+    while(i<ptlen){ A[14]=ctr>>8;A[15]=ctr&0xff; uint8_t Sx[16]; aes_enc_ce(ce,A,Sx);
+        size_t k=ptlen-i<16?ptlen-i:16; for(size_t j=0;j<k;j++) out[i+j]=ct[i+j]^Sx[j]; i+=k; ctr++; }
+    // CBC-MAC verify
+    uint8_t L=2,B[16]={0}; B[0]=(uint8_t)((aadlen>0?0x40:0)|(((8-2)/2)<<3)|(L-1));
+    memcpy(B+1,nonce,nlen); B[14]=ptlen>>8;B[15]=ptlen&0xff;
+    uint8_t X[16]; aes_enc_ce(ce,B,X);
+    if(aadlen>0){ uint8_t hdr[16]={0}; size_t o=0; hdr[0]=aadlen>>8;hdr[1]=aadlen&0xff;o=2;
+        size_t j=0; while(j<aadlen){ while(o<16&&j<aadlen)hdr[o++]=aad[j++];
+            for(int v=0;v<16;v++)X[v]^=hdr[v]; aes_enc_ce(ce,X,X); o=0; memset(hdr,0,16);} }
+    { size_t j=0; uint8_t blk[16];
+      while(j<ptlen){ size_t k=ptlen-j<16?ptlen-j:16; memset(blk,0,16); memcpy(blk,out+j,k);
+          for(int v=0;v<16;v++)X[v]^=blk[v]; aes_enc_ce(ce,X,X); j+=k; } }
+    uint8_t NA[16]={0}; NA[0]=L-1; memcpy(NA+1,nonce,nlen);
+    uint8_t S0[16]; aes_enc_ce(ce,NA,S0);
+    uint8_t mic[8]; for(int v=0;v<8;v++) mic[v]=X[v]^S0[v];
+    return memcmp(mic,ct+ptlen,8)==0;
+}
+#endif
 }}
 
 // ---- AES-128 ECB encrypt/decrypt + RFC 3394 key unwrap (for GTK) -----------
 namespace apfpv { namespace crypto {
-static uint8_t ISB[256]; static bool isb_init=false;
+
+// inverse S-box
+static uint8_t ISB[256];
+static bool isb_init=false;
 static void build_isb(){ if(isb_init)return; for(int i=0;i<256;i++) ISB[S[i]]=i; isb_init=true; }
 static uint8_t mul(uint8_t a,uint8_t b){ uint8_t p=0; for(int i=0;i<8;i++){ if(b&1)p^=a; uint8_t hi=a&0x80; a<<=1; if(hi)a^=0x1b; b>>=1;} return p; }
+
 void aes128_ecb_encrypt(const uint8_t key[16],const uint8_t in[16],uint8_t out[16]){
-    Aes a; aes_key_impl(a,key); aes_enc(a,in,out);
+    Aes a; aes_key(a,key); aes_enc(a,in,out);
 }
 void aes128_ecb_decrypt(const uint8_t key[16],const uint8_t in[16],uint8_t out[16]){
-    build_isb(); Aes a; aes_key_impl(a,key);
+    build_isb(); Aes a; aes_key(a,key);
     uint8_t s[16]; for(int i=0;i<16;i++) s[i]=in[i]^a.rk[160+i];
     for(int r=9;r>=1;r--){
+        // inv shiftrows
         uint8_t t[16];
         t[0]=s[0];t[4]=s[4];t[8]=s[8];t[12]=s[12];
-        t[1]=s[5];t[5]=s[9];t[9]=s[13];t[13]=s[1];
+        t[1]=s[13];t[5]=s[1];t[9]=s[5];t[13]=s[9];
         t[2]=s[10];t[6]=s[14];t[10]=s[2];t[14]=s[6];
-        t[3]=s[15];t[7]=s[3];t[11]=s[7];t[15]=s[11];
-        for(int i=0;i<16;i++) s[i]=ISB[t[i]]^a.rk[r*16+i];
-        for(int c=0;c<4;c++){ uint8_t* col=s+c*4; uint8_t a0=col[0],a1=col[1],a2=col[2],a3=col[3];
-            col[0]=mul(a0,0x0e)^mul(a1,0x0b)^mul(a2,0x0d)^mul(a3,0x09);
-            col[1]=mul(a0,0x09)^mul(a1,0x0e)^mul(a2,0x0b)^mul(a3,0x0d);
-            col[2]=mul(a0,0x0d)^mul(a1,0x09)^mul(a2,0x0e)^mul(a3,0x0b);
-            col[3]=mul(a0,0x0b)^mul(a1,0x0d)^mul(a2,0x09)^mul(a3,0x0e); }
+        t[3]=s[7];t[7]=s[11];t[11]=s[15];t[15]=s[3];
+        for(int i=0;i<16;i++) t[i]=ISB[t[i]];            // inv subbytes
+        for(int i=0;i<16;i++) t[i]^=a.rk[r*16+i];        // addroundkey
+        // inv mixcolumns
+        for(int c=0;c<4;c++){ uint8_t* col=t+c*4; uint8_t a0=col[0],a1=col[1],a2=col[2],a3=col[3];
+            col[0]=mul(a0,14)^mul(a1,11)^mul(a2,13)^mul(a3,9);
+            col[1]=mul(a0,9)^mul(a1,14)^mul(a2,11)^mul(a3,13);
+            col[2]=mul(a0,13)^mul(a1,9)^mul(a2,14)^mul(a3,11);
+            col[3]=mul(a0,11)^mul(a1,13)^mul(a2,9)^mul(a3,14); }
+        for(int i=0;i<16;i++) s[i]=t[i];
     }
-    for(int i=0;i<16;i++) out[i]=s[i]^a.rk[i];
+    uint8_t t[16];
+    t[0]=s[0];t[4]=s[4];t[8]=s[8];t[12]=s[12];
+    t[1]=s[13];t[5]=s[1];t[9]=s[5];t[13]=s[9];
+    t[2]=s[10];t[6]=s[14];t[10]=s[2];t[14]=s[6];
+    t[3]=s[7];t[7]=s[11];t[11]=s[15];t[15]=s[3];
+    for(int i=0;i<16;i++) out[i]=ISB[t[i]]^a.rk[i];
 }
-// RFC 3394 AES Key Unwrap
-bool aes_key_unwrap(const uint8_t kek[16], const uint8_t* wrapped, size_t wlen, uint8_t* out){
-    if (wlen < 16 || (wlen & 7)) return false;
-    size_t n = wlen / 8 - 1;
-    uint8_t A[8]; memcpy(A, wrapped, 8);
-    uint8_t R[256]; memcpy(R, wrapped + 8, n * 8);
-    for (int j = 5; j >= 0; j--) {
-        for (int i = (int)n - 1; i >= 0; i--) {
-            uint8_t in[16], outBlk[16];
-            uint64_t t = (uint64_t)n * (uint64_t)j + (uint64_t)(i + 1);
-            in[0] = A[0]; in[1] = A[1]; in[2] = A[2]; in[3] = A[3];
-            in[4] = (uint8_t)(t >> 24); in[5] = (uint8_t)(t >> 16);
-            in[6] = (uint8_t)(t >> 8); in[7] = (uint8_t)t;
-            memcpy(in + 8, R + i * 8, 8);
-            aes128_ecb_decrypt(kek, in, outBlk);
-            memcpy(A, outBlk, 8);
-            memcpy(R + i * 8, outBlk + 8, 8);
+
+// RFC 3394 AES Key Unwrap. wrapped = (n+1)*8 bytes. out = n*8.
+bool aes_key_unwrap(const uint8_t kek[16],const uint8_t* wrapped,size_t wlen,uint8_t* out){
+    if(wlen<16 || (wlen%8)!=0) return false;
+    size_t n=(wlen/8)-1;
+    uint8_t A[8]; memcpy(A,wrapped,8);
+    memcpy(out,wrapped+8,n*8);
+    for(int j=5;j>=0;j--){
+        for(size_t i=n;i>=1;i--){
+            uint8_t blk[16]; memcpy(blk,A,8); memcpy(blk+8,out+(i-1)*8,8);
+            uint64_t t=n*(uint64_t)j+i;
+            for(int k=0;k<8;k++) blk[7-k]^=(uint8_t)(t>>(k*8));
+            uint8_t dec[16]; aes128_ecb_decrypt(kek,blk,dec);
+            memcpy(A,dec,8); memcpy(out+(i-1)*8,dec+8,8);
+            if(i==1) {} // continue
         }
     }
-    uint64_t magic = 0xa6a6a6a6a6a6a6a6ULL;
-    return memcmp(A, &magic, 8) == 0 && memcpy(out, R, n * 8);
+    static const uint8_t IV[8]={0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
+    return memcmp(A,IV,8)==0;
 }
-void aes_key_wrap(const uint8_t kek[16], const uint8_t* plain, size_t plen, uint8_t* out){
-    size_t n = plen / 8;
-    memset(out, 0xa6, 8);
-    memcpy(out + 8, plain, plen);
-    uint8_t A[8]; memcpy(A, out, 8);
-    for (int j = 0; j <= 5; j++) {
-        for (int i = 0; i < (int)n; i++) {
-            uint8_t in[16], outBlk[16];
-            uint64_t t = (uint64_t)n * (uint64_t)j + (uint64_t)(i + 1);
-            memcpy(in, A, 8);
-            memcpy(in + 8, out + 8 + i * 8, 8);
-            aes128_ecb_encrypt(kek, in, outBlk);
-            memcpy(A, outBlk, 8);
-            A[4] ^= (uint8_t)(t >> 24); A[5] ^= (uint8_t)(t >> 16);
-            A[6] ^= (uint8_t)(t >> 8); A[7] ^= (uint8_t)t;
-            memcpy(out + 8 + i * 8, outBlk + 8, 8);
+
+// RFC 3394 AES Key Wrap (inverse of unwrap) — wraps plen bytes (multiple of 8, >=16) into
+// out[plen+8]. Used by the AP-side 4-way (M3) to deliver the GTK encrypted under the KEK.
+void aes_key_wrap(const uint8_t kek[16],const uint8_t* plain,size_t plen,uint8_t* out){
+    size_t n=plen/8;
+    static const uint8_t IV[8]={0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
+    uint8_t A[8]; memcpy(A,IV,8);
+    memcpy(out+8,plain,plen);                       // R[1..n] = P
+    for(int j=0;j<=5;j++){
+        for(size_t i=1;i<=n;i++){
+            uint8_t blk[16]; memcpy(blk,A,8); memcpy(blk+8,out+i*8,8);
+            uint8_t enc[16]; aes128_ecb_encrypt(kek,blk,enc);
+            memcpy(A,enc,8);
+            uint64_t t=n*(uint64_t)j+i;
+            for(int k=0;k<8;k++) A[7-k]^=(uint8_t)(t>>(k*8));   // A = MSB64(B) XOR t
+            memcpy(out+i*8,enc+8,8);                            // R[i] = LSB64(B)
         }
     }
-    memcpy(out, A, 8);
+    memcpy(out,A,8);                                 // C[0] = A
 }
 }}
