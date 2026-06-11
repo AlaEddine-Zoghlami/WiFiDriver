@@ -3,6 +3,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include "RtlUsbAdapter.h"
 #include "RadioManagementModule.h"
@@ -48,6 +49,7 @@ private:
     std::mutex  _scanMtx;
 public:
     std::atomic<bool> _alive{true};
+    std::shared_ptr<std::atomic<bool>> _alivePtr;  // TOCTOU-safe: set by dispatch lambda, survives destruction
     std::atomic<bool> _gotAuthResp{false}, _gotAssocOk{false}, _gotDeauth{false};
     // The self MAC + AP BSSID we are joining. onMgmtFrame MUST match a1==self && a2==bssid
     // before believing an auth/assoc-resp — otherwise overheard frames from OTHER stations
