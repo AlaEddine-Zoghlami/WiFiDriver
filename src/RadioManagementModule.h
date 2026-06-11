@@ -181,10 +181,20 @@ public:
   void ArmIQKOnNextChannelSet() { _needIQK = true; }
   void hw_var_rcr_config(uint32_t rcr);
   void SetMonitorMode();
+  /* Post-association RX filter: drop the monitor RCR_AAP (promiscuous) and set FORCEACK so the
+   * chip HW-ACKs unicast addressed to us — otherwise the AP never sees an ACK and retransmits
+   * every RTP frame (the ~37% CCMP PN-replay storm = choppy A/V). Call after MSR->STATION. */
+  void SetStationRxFilter();
   /* The channel the radio is currently tuned to (set by set_channel_bwmode).
    * Used by StationMode to pick a band-correct mgmt TX rate: 5 GHz (ch>14)
    * has no CCK, so auth/assoc must go at OFDM, like the kernel. */
   uint8_t current_channel() const { return _currentChannel; }
+  /* HT40 prime-channel offset for `channel` (LOWER if the primary sits below the
+   * 40 MHz pair's center, UPPER if above, DONT_CARE if the channel has no 40 MHz
+   * pairing). REQUIRED when tuning CHANNEL_WIDTH_40: offset 0 (DONT_CARE) leaves
+   * the chip's subcarrier mapping undefined ("SCMapping: DONOT CARE Mode Setting")
+   * and RX on the primary 20 MHz half is garbage. */
+  uint8_t prime_offset_40mhz(uint8_t channel) const;
   void set_channel_bwmode(uint8_t channel, uint8_t channel_offset,
                           ChannelWidth_t bwmode);
   void phy_set_rf_reg(RfPath eRFPath, uint16_t RegAddr, uint32_t BitMask,

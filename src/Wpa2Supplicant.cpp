@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <android/log.h>
 
 #ifdef _WIN32
 extern "C" __declspec(dllimport) long __stdcall
@@ -315,12 +316,29 @@ bool Wpa2Supplicant::decryptData(const uint8_t* frame, size_t len, std::vector<u
     // Try the length as-is, then minus the FCS (robust whether or not the FCS is present).
     bool ok = _c.ccmp_decrypt(key, nonce, enc, encLen, aad, aadLen, plain);
     if (!ok && encLen > 12) ok = _c.ccmp_decrypt(key, nonce, enc, encLen - 4, aad, aadLen, plain);
-    if (!ok) return false;
+    if (!ok) {
+        // MIC/CCM failure = wrong key (stale PTK/GTK after reconnect) or corrupt frame.
+        static int micFails = 0;
+        if ((++micFails % 200) == 1)
+            __android_log_print(ANDROID_LOG_WARN, "rxd-decfail",
+                "MIC-fail #%d grp=%d kid=%d (wrong key / corrupt)", micFails, (int)(frame[4]&1), (int)kid);
+        return false;
+    }
     // RX anti-replay (post-MIC): the 48-bit CCMP PN must strictly increase per key, else drop.
     uint64_t pnVal = ((uint64_t)pn[0]<<40)|((uint64_t)pn[1]<<32)|((uint64_t)pn[2]<<24)
                    | ((uint64_t)pn[3]<<16)|((uint64_t)pn[4]<<8)|(uint64_t)pn[5];
     uint64_t& lastPn = (frame[4]&0x01) ? _rxPnGtk[kid] : _rxPnPair;
-    if (pnVal <= lastPn) return false;             // replayed frame
+    if (pnVal <= lastPn) {
+        // PN not increasing = an 802.11 retransmit (AP re-sends until ACKed) OR a stale PN window
+        // carried across a reconnect (new key, but lastPn still holds the old session's high PN).
+        static int pnReplays = 0;
+        if ((++pnReplays % 200) == 1)
+            __android_log_print(ANDROID_LOG_WARN, "rxd-decfail",
+                "PN-replay #%d grp=%d kid=%d pn=%llu last=%llu (retransmit or stale PN window)",
+                pnReplays, (int)(frame[4]&1), (int)kid,
+                (unsigned long long)pnVal, (unsigned long long)lastPn);
+        return false;             // replayed frame
+    }
     lastPn = pnVal;
     return true;
 }

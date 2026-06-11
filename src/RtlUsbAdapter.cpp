@@ -649,6 +649,7 @@ struct RtlUsbAdapter::AsyncRxState {
   std::function<void(const Packet &)> proc;
   std::atomic<bool> running{true};
   std::atomic<int> inflight{0};
+  libusb_device_handle *dev_handle = nullptr;  // for stall recovery
   std::vector<libusb_transfer *> transfers;
   std::vector<std::vector<uint8_t>> buffers;
   // recv_tasklet queue: the URB callback pushes a raw recvbuf copy here and
@@ -656,7 +657,7 @@ struct RtlUsbAdapter::AsyncRxState {
   std::mutex qMtx;
   std::condition_variable qCv;
   std::deque<std::vector<uint8_t>> queue;
-  std::thread worker;
+  std::vector<std::thread> workers;  // N parallel CCMP decrypt threads (multi-core)
   std::atomic<uint64_t> rxBufs{0};        // recvbufs handed to the worker (diag)
   // While paused, the callback retires URBs WITHOUT resubmitting, so the bulk-IN
   // pipe drains and a bulk-OUT TX can go (libusb userspace serialises OUT behind
@@ -708,12 +709,20 @@ static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
   size_t idx = (size_t)-1;
   for (size_t i = 0; i < st->transfers.size(); ++i)
     if (st->transfers[i] == xfer) { idx = i; break; }
-  if (st->running.load() && !st->paused.load() && !fatal &&
-      libusb_submit_transfer(xfer) == 0)
-    return;                       // re-queued, flag stays true, still in flight
+  if (st->running.load() && !st->paused.load() && !fatal) {
+    if (libusb_submit_transfer(xfer) == 0)
+      return;
+    // Resubmit failed: endpoint stalled from URB overflow at high bitrate.
+    // Clear halt via stored dev_handle and retry once.
+    if (st->dev_handle) {
+      libusb_clear_halt(st->dev_handle, xfer->endpoint);
+      if (libusb_submit_transfer(xfer) == 0)
+        return;
+    }
+  }
   if (idx != (size_t)-1 && idx < st->submitted.size())
     st->submitted[idx]->store(false, std::memory_order_release);
-  st->inflight.fetch_sub(1);      // retired this URB (cancelled / paused / fatal)
+  st->inflight.fetch_sub(1);
 }
 
 void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
@@ -722,8 +731,11 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
   auto st = std::make_shared<AsyncRxState>();
   st->logger = _logger;
   st->proc = std::move(processor);
+  st->dev_handle = _dev_handle;   // for stall recovery in callback
   st->running.store(true);
-  st->worker = std::thread(apfpv_rx_worker, st.get());   // start the recv_tasklet
+  // Single worker (matching Linux tasklet model). ARM-CE AES provides the
+  // throughput (20 cycles/block vs 1500 for SW). Multi-core not needed.
+  st->workers.emplace_back(apfpv_rx_worker, st.get());
   // Native USB: 0 = no timeout (kernel model). Over WSL USB/IP an always-pending
   // IN URB blocks the OUT URB, so DEVOURER_RX_URB_TO (ms) lets the IN URBs cycle.
   unsigned urbTo = 0;
@@ -737,7 +749,7 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
   // MediaTek phones) an oversized transfer OVERFLOWS the URB and STALLs the bulk-IN
   // endpoint. apfpv_async_rx_cb then blindly resubmits into the halted EP (no clear_halt),
   // so RX dies — trickle/black-screen at full RTP rate while the sparse connect frames
-  // still worked. 64K holds the max aggregate so it never overflows. Tunable for testing.
+  // still worked. 64K holds the max aggregate so it never overflows on MTK USB hosts.
   size_t rxBufBytes = 64 * 1024;
   if (const char *e = std::getenv("DEVOURER_RX_BUFK")) rxBufBytes = (size_t)std::atoi(e) * 1024;
   for (int i = 0; i < numUrbs; ++i) {
@@ -762,10 +774,12 @@ void RtlUsbAdapter::stopAsyncRx() {
   if (!st) return;
   st->running.store(false);
   for (auto *t : st->transfers) libusb_cancel_transfer(t);
+  // Recover a stalled RX endpoint from URB overflow at high bitrate
+  if (_bulk_in_ep) libusb_clear_halt(_dev_handle, _bulk_in_ep);
   for (int i = 0; i < 200 && st->inflight.load() > 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  st->qCv.notify_all();                       // wake the worker so it can exit
-  if (st->worker.joinable()) st->worker.join();
+  st->qCv.notify_all();                       // wake all workers so they can exit
+  for (auto &w : st->workers) if (w.joinable()) w.join();
   for (auto *t : st->transfers) libusb_free_transfer(t);
   _asyncRx.reset();
 }
@@ -853,7 +867,7 @@ bool RtlUsbAdapter::sendStationFrameSync(uint8_t *data, size_t len) {
     if (!std::getenv("DEVOURER_TX_BLIND")) {
       uint16_t e0 = 0, e = 0;
       try { e0 = rtw_read16(0x041A); } catch (...) {}
-      auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(40);
+      auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(10);  // 65Mbps: faster TX → less RX starvation
       int settled = 0;
       e = e0;
       do {

@@ -134,6 +134,23 @@ void RadioManagementModule::rtw_hal_set_msr(uint8_t net_type) {
   }
 }
 
+void RadioManagementModule::SetStationRxFilter() {
+  // Same bits as hw_var_set_monitor EXCEPT: (a) RCR_AAP removed — we no longer accept ALL unicast,
+  // only frames addressed to us (RCR_APM); (b) FORCEACK added — the HW now auto-ACKs those frames.
+  // Without this the chip sniffs the AP's unicast RTP but never ACKs, so the AP retransmits every
+  // frame (~37% PN-replay) and the link jitters. ICV/MIC/FCS bits unchanged so SW CCMP still decodes.
+  uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
+                 RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
+                 RCR_APPFCS | FORCEACK;
+  hw_var_rcr_config(rcr);
+  _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
+  // Read REG_RCR back to PROVE the filter stuck (a later monitor write or a failed control transfer
+  // would silently leave promiscuous/no-ACK). AAP must read 0 and FORCEACK 1 for HW ACK to work.
+  uint32_t rb = _device.rtw_read32(REG_RCR);
+  _logger->info("[SetStationRxFilter] RCR set=0x{:08x} readback=0x{:08x} AAP={} FORCEACK={}",
+                rcr, rb, (rb & RCR_AAP) ? 1 : 0, (rb & FORCEACK) ? 1 : 0);
+}
+
 void RadioManagementModule::hw_var_set_monitor() {
   /* Receive all type */
   uint32_t rcr_bits = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
@@ -185,6 +202,15 @@ static uint8_t rtw_get_center_ch(uint8_t channel, ChannelWidth_t chnl_bw,
   }
 
   return center_ch;
+}
+
+uint8_t RadioManagementModule::prime_offset_40mhz(uint8_t channel) const {
+  // Primary below the pair's center => LOWER; above => UPPER (kernel convention).
+  // Uses the same 40 MHz center map as rtw_get_center_ch so the two always agree.
+  int center = get_40mhz_center_channel(channel);
+  if (center > channel) return HAL_PRIME_CHNL_OFFSET_LOWER;
+  if (center < channel) return HAL_PRIME_CHNL_OFFSET_UPPER;
+  return HAL_PRIME_CHNL_OFFSET_DONT_CARE;  // no 40 MHz pairing for this channel
 }
 
 void RadioManagementModule::set_channel_bwmode(uint8_t channel,

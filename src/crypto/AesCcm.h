@@ -2,11 +2,18 @@
 #include <cstdint>
 #include <cstddef>
 namespace apfpv { namespace crypto {
+// AES-128 expanded key (cached by caller to avoid per-packet key expansion)
+struct Aes { uint8_t rk[176]; };
+// Build expanded key from 16-byte raw key. Call ONCE per session.
+void aes_key_expand(const uint8_t key[16], Aes& out);
+
 // AES-128-CCM as used by CCMP (8-byte MIC, 13-byte nonce, L=2).
 // decrypt: returns true if MIC valid; out gets plaintext (clen-8 bytes).
+// Pass a cached expanded key (aes_key_expand) for the hot path, or nullptr.
 bool aes_ccm_decrypt(const uint8_t key[16], const uint8_t* nonce, size_t nlen,
                      const uint8_t* aad, size_t aadlen,
-                     const uint8_t* ct, size_t ctlen, uint8_t* out);
+                     const uint8_t* ct, size_t ctlen, uint8_t* out,
+                     const Aes* aes_cache = nullptr);
 void aes_ccm_encrypt(const uint8_t key[16], const uint8_t* nonce, size_t nlen,
                      const uint8_t* aad, size_t aadlen,
                      const uint8_t* pt, size_t ptlen, uint8_t* out /* ptlen+8 */);

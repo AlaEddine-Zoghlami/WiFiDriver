@@ -48,10 +48,8 @@ class HalModule {
   uint8_t _usbTxAggDescNum =
       0x01; // adjust value for OQT Overflow issue 0x3; only 4 bits
   RX_AGG_MODE _rxAggMode = RX_AGG_USB;
-  uint8_t _rxAggDmaTimeout = 0x6; /* 6, absolute time = 34ms/(2^6) */
-  uint8_t _rxAggDmaSize =
-      16; /* uint: 128b, 0x0A = 10 =
-             MAX_RX_DMA_BUFFER_SIZE/2/pHalData.UsbBulkOutSize */
+  uint8_t _rxAggDmaTimeout = 0x4; /* 4: 34ms/16≈2.1ms — balance latency vs batching */
+  uint8_t _rxAggDmaSize = 32;     /* 32×128B=4KB per DMA page */
   /* Phydm DM watchdog. Lazily constructed in `rtw_hal_init` after
    * `RadioManagementModule` is fully wired up. */
   std::unique_ptr<PhydmWatchdog> _phydmWatchdog;

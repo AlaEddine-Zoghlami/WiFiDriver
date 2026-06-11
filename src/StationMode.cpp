@@ -51,7 +51,12 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
         // RX daemon -> corrupted filter -> auth-response dropped. Whole-arm serialization
         // measured 3/5 vs 1/5 (DEVOURER_NO_PAUSE_CAL disables the runProbe-level pause).
         _rm.ArmIQKOnNextChannelSet();
-        _rm.set_channel_bwmode(_rm.current_channel(), 0, _connectWidth);   // 20 (legal DE) or 40, set via setConnectWidth
+        // 40 MHz REQUIRES the HT40 prime-channel offset (LOWER/UPPER): with 0 (DONT_CARE) the
+        // chip's subcarrier mapping is undefined ("SCMapping: DONOT CARE Mode Setting") and RX of
+        // the AP's primary-channel frames is garbage — 40 MHz "connected but barely any frames".
+        uint8_t off40 = (_connectWidth == CHANNEL_WIDTH_40)
+                            ? _rm.prime_offset_40mhz(_rm.current_channel()) : 0;
+        _rm.set_channel_bwmode(_rm.current_channel(), off40, _connectWidth);   // 20 or 40, via setConnectWidth
     }
     // (1) own MAC -> REG_MACID
     for (int i = 0; i < 4; ++i) _dev.rtw_write8(REG_MACID + i, self.b[i]);
@@ -169,6 +174,10 @@ void StationMode::becomeStation(const MacAddr& bssid) {
         uint8_t msr = (uint8_t)((_dev.rtw_read8(MSR) & 0x0C) | HW_STATE_STATION);
         _dev.rtw_write8(MSR, msr);
     }
+    // Switch the RX filter from monitor (promiscuous, no ACK) to real-station (our-MAC + FORCEACK)
+    // so the chip HW-ACKs the AP's unicast RTP — without this the AP retransmits every frame and the
+    // link is choppy. Env-gated for A/B (DEVOURER_NO_STATION_ACK keeps the old monitor RX filter).
+    if (!std::getenv("DEVOURER_NO_STATION_ACK")) _rm.SetStationRxFilter();
     if (!std::getenv("DEVOURER_SKIP_H2C")) sendStationH2C(/*macid=*/0, bssid);
     SMLOG("becomeStation: MSR->STATION + connected H2C sent");
 }
@@ -448,13 +457,15 @@ void StationMode::onScanFrame(const uint8_t* frame, size_t len) {
     // thread — snapshot the SSID under the lock (a torn std::string read during a
     // concurrent reassign crashes parseBeacon's compare), parse off-lock, then
     // update the result under the lock.
-    std::string ssid;
-    { std::lock_guard<std::mutex> lk(_scanMtx); ssid = _scanSsid; }
-    ApInfo info;
-    if (ScanProbe::parseBeacon(frame, len, ssid, info)) {
-        std::lock_guard<std::mutex> lk(_scanMtx);
-        if (!_scanResult.found || info.rssi > _scanResult.rssi) _scanResult = info;
-    }
+    try {
+        std::string ssid;
+        { std::lock_guard<std::mutex> lk(_scanMtx); ssid = _scanSsid; }
+        ApInfo info;
+        if (ScanProbe::parseBeacon(frame, len, ssid, info)) {
+            std::lock_guard<std::mutex> lk(_scanMtx);
+            if (!_scanResult.found || info.rssi > _scanResult.rssi) _scanResult = info;
+        }
+    } catch (...) { /* garbled frame at high rate */ }
 }
 
 ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChannelMs) {

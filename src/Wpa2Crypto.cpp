@@ -37,7 +37,17 @@ static std::array<uint8_t,16> eapol_mic_impl(const uint8_t* kck,const uint8_t* m
 static bool ccmp_decrypt_impl(const uint8_t* tk,const uint8_t* nonce,const uint8_t* in,size_t inLen,
                               const uint8_t* aad,size_t aadLen,std::vector<uint8_t>& out){
     out.resize(inLen>8?inLen-8:0);
-    return crypto::aes_ccm_decrypt(tk,nonce,13,aad,aadLen,in,inLen,out.data());
+    // Cache expanded AES key per thread. At 65Mbps re-expanding the same PTK/GTK
+    // every packet (~10µs × 5600 = 56ms/s) burns ~5.6% of a CPU core.
+    static thread_local uint8_t cacheKey[16] = {};
+    static thread_local crypto::Aes cacheAes;
+    static thread_local bool cacheValid = false;
+    if (!cacheValid || std::memcmp(cacheKey, tk, 16) != 0) {
+        crypto::aes_key_expand(tk, cacheAes);
+        std::memcpy(cacheKey, tk, 16);
+        cacheValid = true;
+    }
+    return crypto::aes_ccm_decrypt(tk,nonce,13,aad,aadLen,in,inLen,out.data(),&cacheAes);
 }
 static std::vector<uint8_t> ccmp_encrypt_impl(const uint8_t* tk,const uint8_t* nonce,const uint8_t* in,
                               size_t inLen,const uint8_t* aad,size_t aadLen){
