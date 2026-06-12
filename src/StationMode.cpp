@@ -223,6 +223,20 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
     }
     SMLOG("station H2C: MACID_CFG=%d MEDIA_STATUS=%d RSSI=%d",
           h2cRa ? 1 : 0, h2cMs ? 1 : 0, h2cRssi ? 1 : 0);
+#ifdef __ANDROID__
+    // Hal_PatchwithJaguar_8812 (kernel: hal_com.c:4355-4363, called after
+    // H2C_MEDIA_STATUS_RPT for RTL8812 in station mode). Configures VHT LSIG
+    // length and BW indication for non-Jaguar AP peers. Without this the chip
+    // may mis-handle VHT A-MPDU aggregates.
+    // rVhtlen_Use_Lsig_Jaguar = 0x8c3 (BB register), 0x3F for non-Jaguar AP
+    _dev.rtw_write8(0x8c3, 0x3F);
+    // REG_TCR (0x0604) + 3 = 0x0607: set bits 0,1,2 for VHT A-MPDU timing
+    uint8_t tcr3 = _dev.rtw_read8(0x0607);
+    _dev.rtw_write8(0x0607, (uint8_t)(tcr3 | 0x07)); // BIT0|BIT1|BIT2
+    // rBWIndication_Jaguar (0x834) + 3 = 0x837: clear BIT2 for non-Jaguar AP
+    uint8_t bw3 = _dev.rtw_read8(0x837);
+    _dev.rtw_write8(0x837, (uint8_t)(bw3 & ~0x04)); // ~BIT2
+#endif
 }
 
 // Management-frame TX rate, BAND-AWARE. Faithful to the kernel
