@@ -689,6 +689,9 @@ struct RtlUsbAdapter::AsyncRxState {
 // stalls URB refill / TX completion.
 static void apfpv_rx_worker(RtlUsbAdapter::AsyncRxState *st) {
   FrameParser fp{st->logger};
+  // Pipeline layer counters: track frames at each stage to find the bottleneck
+  uint64_t urbCount=0, urbBytes=0, deaggPkts=0, dispatchPkts=0;
+  auto t0 = std::chrono::steady_clock::now();
   for (;;) {
     RtlUsbAdapter::AsyncRxState::QEntry qe{};
     {
@@ -698,10 +701,24 @@ static void apfpv_rx_worker(RtlUsbAdapter::AsyncRxState *st) {
       qe = st->queue.front();
       st->queue.pop_front();
     }
+    urbCount++; urbBytes += qe.len;
     try {
       auto pkts = fp.recvbuf2recvframe(std::span<uint8_t>{qe.buf->data, qe.len});
+      deaggPkts += pkts.size();
+      dispatchPkts += pkts.size();
       for (auto &p : pkts) st->proc(p);
     } catch (...) {}
+    // Pipeline health every 1 second
+    auto t1 = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+    if (elapsed >= 1000) {
+      float secs = (float)elapsed / 1000.0f;
+      __android_log_print(4, "rx-pipe",
+        "URBs=%d/s MB=%.1f/s deagg=%d/s disp=%d/s (%.1f pkts/URB)",
+        (int)(urbCount/secs), (urbBytes/secs)/1e6, (int)(deaggPkts/secs),
+        (int)(dispatchPkts/secs), (float)deaggPkts/(float)(urbCount+1));
+      urbCount=urbBytes=deaggPkts=dispatchPkts=0; t0 = t1;
+    }
     // Return buffer to free pool (kernel: return skb to free_recv_skb_queue)
     if (qe.buf) {
       std::lock_guard<std::mutex> lk(st->qMtx);
