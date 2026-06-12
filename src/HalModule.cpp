@@ -1898,11 +1898,19 @@ void HalModule::_InitBurstPktLen() {
     _device.rtw_write32(REG_FAST_EDCA_CTRL, 0x03087777);
   }
 
-  // AMPDUBurstMode is always false
-  // if (pHalData.AMPDUBurstMode)
-  //{
-  //    adapterState.Device.rtw_write8(REG_AMPDU_BURST_MODE_8812, 0x5F);
-  //}
+  // Kernel _InitRDGSetting_8812A (usb_halinit.c:959-963): Reverse-Direction-Grant
+  // + Response-Packet config. REG_RD_RESP_PKT_TH (0x0463) governs how the HW builds
+  // RESPONSE frames (ACK/BA) to received packets — without it the HW may not emit a
+  // Block-Ack for A-MPDU aggregates. These were MISSING (only a partial RD_CTRL write
+  // existed). Add the exact kernel triple. DEVOURER_SKIP_RDG disables for A/B.
+  if (!std::getenv("DEVOURER_SKIP_RDG")) {
+    _device.rtw_write8(0x0524, 0xFF);    // REG_RD_CTRL (kernel: byte=0xFF)
+    _device.rtw_write16(0x0544, 0x200);  // REG_RD_NAV_NXT
+    _device.rtw_write8(0x0463, 0x05);    // REG_RD_RESP_PKT_TH — HW response (BA) threshold
+    // AMPDU burst mode: lets the HW handle back-to-back A-MPDU subframes (kernel
+    // gates this on AMPDUBurstMode; the Fritzbox sends bursts so enable it).
+    _device.rtw_write8(0x04BC, 0x5F);    // REG_AMPDU_BURST_MODE_8812
+  }
 
   _device.rtw_write8(0x1c, (uint8_t)(_device.rtw_read8(0x1c) | BIT5 |
                                      BIT6)); /* to prevent mac is reseted by

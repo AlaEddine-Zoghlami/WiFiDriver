@@ -158,15 +158,38 @@ void RadioManagementModule::SetStationRxFilter() {
   // wasting airtime on retransmits of already-received frames.
   // If throughput STAYS ~20 Mbps, FORCEACK was actually working and the bottleneck
   // is elsewhere (wrong rate-control, missing feature, etc.)
-  // RCR_VHT_DACK BIT26: 1=ACK response, 0=BA response. FORCEACK=1 makes HW
-  // send ACK per-frame instead of Block-Ack for A-MPDU → AP sees no BA →
-  // sends DELBA → tears down BA session → no A-MPDU. CLEAR BIT26 so HW
-  // sends BA for A-MPDU aggregates. For single MPDU, ACK is still auto-gen'd.
-  // DELBA from AP CONFIRMED: BA sessions are established then torn down because
-  // our responses are ACKs (not BAs). Single frame ACK still works.
-  uint32_t rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
-                 RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
-                 RCR_APPFCS /* FORCEACK=0: BA for A-MPDU, ACK auto for single */;  // required: 21 vs 11 Mbps without. BA=ACK per-frame per spec when no BA session.
+  // FORCEACK: HW auto-ACK for single MPDU. For A-MPDU, HW auto-generates BA
+  // at SIFS (both kernel drivers confirm: no software BA — HW handles it).
+  // BIT26 controls VHT SINGLE MPDU response only — A-MPDU always gets BA from HW.
+  // Restored to 1 (proven: 21 vs 11 Mbps without for single frames).
+  // ============================================================================
+  // KERNEL-EXACT STATION RCR (the A-MPDU fix). The kernel's usb_halinit.c station
+  // RCR is APM | AM | AB | CBSSID_DATA | CBSSID_BCN | HTC_LOC_CTRL | AMF | ... and
+  // explicitly does NOT set RCR_AAP. RCR_AAP (promiscuous "accept all unicast")
+  // puts the MAC in a monitor-style path that BYPASSES the infrastructure-station
+  // RX state machine — including HW auto-Block-Ack generation for A-MPDU. With AAP
+  // the chip ACKs single frames (FORCEACK) but never auto-BAs aggregates, so the AP
+  // sends ADDBA, gets no BA, and tears the session down with DELBA → single-frame
+  // fallback → ~25 Mbps ceiling. CBSSID_DATA (match REG_BSSID, set to the AP) + APM
+  // (match our MAC) is the real station path that triggers auto-BA → A-MPDU → 65Mbps.
+  // DEVOURER_RCR_AAP=1 restores the old promiscuous behavior for A/B comparison.
+  // DEFAULT = kernel-exact station RCR (the A-MPDU fix). The kernel's usb_halinit.c
+  // station RCR uses APM | CBSSID_DATA (match REG_BSSID, set to the AP) and does NOT
+  // set RCR_AAP. RCR_AAP (promiscuous) routes frames through a monitor-style path that
+  // BYPASSES the infrastructure-station RX engine — so the HW never processes the AP's
+  // ADDBA Request and never arms its SIFS Block-Ack engine. Result: ADDBA accepted (our
+  // software responds) but HW emits no BA for the A-MPDU → AP DELBAs → single-frame
+  // ~25Mbps ceiling. Routing frames through the real station path (CBSSID_DATA) lets
+  // the HW process ADDBA + auto-BA the aggregates → A-MPDU → 65Mbps.
+  // DEVOURER_RCR_AAP=1 restores promiscuous (only if CBSSID breaks RX on some AP).
+  uint32_t rcr;
+  if (std::getenv("DEVOURER_RCR_AAP")) {
+    rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
+          RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
+  } else {
+    rcr = RCR_APM | RCR_AM | RCR_AB | RCR_CBSSID_DATA | RCR_CBSSID_BCN |
+          RCR_HTC_LOC_CTRL | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
+  }
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
