@@ -181,9 +181,15 @@ void RadioManagementModule::SetStationRxFilter() {
   // software responds) but HW emits no BA for the A-MPDU → AP DELBAs → single-frame
   // ~25Mbps ceiling. Routing frames through the real station path (CBSSID_DATA) lets
   // the HW process ADDBA + auto-BA the aggregates → A-MPDU → 65Mbps.
-  // DEVOURER_RCR_AAP=1 restores promiscuous (only if CBSSID breaks RX on some AP).
+  // Kernel station RCR (FORCEACK=1): host handles single-frame ACK, firmware
+  // handles Block-Ack at SIFS once armed via H2C 0x34. Windows RCR (0x3f6b00f4,
+  // FORCEACK=0) works only with FWOffload where firmware handles ALL ACK/BA.
+  // Without FWOffload, FORCEACK=0 breaks auth/assoc (no ACK for mgmt frames).
+  // DEVOURER_RCR_WINDOWS enables the Windows RCR for A/B comparison.
   uint32_t rcr;
-  if (std::getenv("DEVOURER_RCR_AAP")) {
+  if (std::getenv("DEVOURER_RCR_WINDOWS")) {
+    rcr = 0x3f6b00f4;  // Windows RCR (FORCEACK=0, needs FWOffload)
+  } else if (std::getenv("DEVOURER_RCR_AAP")) {
     rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
           RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
   } else {
@@ -192,6 +198,11 @@ void RadioManagementModule::SetStationRxFilter() {
   }
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
+  // RXFLTMAP1: accept BAR (subtype 8) + BA (subtype 9) + PS-Poll (subtype 10).
+  // The kernel default is BIT10 only (PS-Poll). Without BIT8/BIT9, the chip HW
+  // filters out BlockAckReq and BlockAck control frames. When the AP sends BAR
+  // after not seeing our SIFS-BA, the chip drops it → AP gets no BA → DELBA.
+  _device.rtw_write16(REG_RXFLTMAP1, BIT8 | BIT9 | BIT10);  // BAR + BA + PS-Poll
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
   // FORCEACK=1 (HW ACKs frames to our MAC) are both expected now.
   uint32_t rb = _device.rtw_read32(REG_RCR);

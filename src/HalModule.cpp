@@ -1725,7 +1725,10 @@ void HalModule::_InitEDCA_8812AUsb() {
   _device.rtw_write16(REG_SIFS_TRX, 0x100a);
 
   /* TXOP */
-  _device.rtw_write32(REG_EDCA_BE_PARAM, 0x005EA42B);
+  // Kernel EDCA (0x005EA42B). Windows EDCA (0x2ba45e00) is FWOffload-specific.
+  // DEVOURER_EDCA_WINDOWS enables Windows EDCA for A/B comparison.
+  _device.rtw_write32(REG_EDCA_BE_PARAM,
+      std::getenv("DEVOURER_EDCA_WINDOWS") ? 0x2ba45e00 : 0x005EA42B);
   _device.rtw_write32(REG_EDCA_BK_PARAM, 0x0000A44F);
   _device.rtw_write32(REG_EDCA_VI_PARAM, 0x005EA324);
   _device.rtw_write32(REG_EDCA_VO_PARAM, 0x002FA226);

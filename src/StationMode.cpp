@@ -193,8 +193,10 @@ void StationMode::becomeStation(const MacAddr& bssid) {
     // Switch the RX filter from monitor (promiscuous, no ACK) to real-station (our-MAC + FORCEACK)
     // so the chip HW-ACKs the AP's unicast RTP — without this the AP retransmits every frame and the
     // link is choppy. Env-gated for A/B (DEVOURER_NO_STATION_ACK keeps the old monitor RX filter).
-    if (!std::getenv("DEVOURER_NO_STATION_ACK")) _rm.SetStationRxFilter();
+    // Windows sequence: H2C 0x34 (FW join) fires BEFORE RCR is set. The firmware
+    // needs to enter offload mode before the station RX filter activates.
     if (!std::getenv("DEVOURER_SKIP_H2C")) sendStationH2C(/*macid=*/0, bssid);
+    if (!std::getenv("DEVOURER_NO_STATION_ACK")) _rm.SetStationRxFilter();
     SMLOG("becomeStation: MSR->STATION + connected H2C sent");
 }
 
