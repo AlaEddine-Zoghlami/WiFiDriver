@@ -233,12 +233,12 @@ static uint8_t rtw_get_center_ch(uint8_t channel, ChannelWidth_t chnl_bw,
 }
 
 uint8_t RadioManagementModule::prime_offset_40mhz(uint8_t channel) const {
-  // Primary below the pair's center => LOWER; above => UPPER (kernel convention).
-  // Uses the same 40 MHz center map as rtw_get_center_ch so the two always agree.
+  // Center > primary -> secondary ABOVE primary -> UPPER offset (e.g., ch44: center=46, sec=ch48).
+  // Center < primary -> secondary BELOW primary -> LOWER offset (e.g., ch40: center=38, sec=ch36).
   int center = get_40mhz_center_channel(channel);
-  if (center > channel) return HAL_PRIME_CHNL_OFFSET_LOWER;
-  if (center < channel) return HAL_PRIME_CHNL_OFFSET_UPPER;
-  return HAL_PRIME_CHNL_OFFSET_DONT_CARE;  // no 40 MHz pairing for this channel
+  if (center > channel) return HAL_PRIME_CHNL_OFFSET_UPPER;  // secondary above
+  if (center < channel) return HAL_PRIME_CHNL_OFFSET_LOWER;   // secondary below
+  return HAL_PRIME_CHNL_OFFSET_DONT_CARE;
 }
 
 void RadioManagementModule::set_channel_bwmode(uint8_t channel,
@@ -262,6 +262,10 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
 
   rtw_hal_set_chnl_bw(center_ch, bwmode, channel_offset,
                       chnl_offset80); /* set center channel */
+  // _currentChannel gets set to CenterFrequencyIndex1 (= center_ch) by
+  // PHY_HandleSwChnlAndSetBW8812. Override to the PRIMARY channel so
+  // current_channel() returns the correct 802.11 primary, not the center.
+  if (channel != center_ch) _currentChannel = channel;
 }
 
 void RadioManagementModule::rtw_hal_set_chnl_bw(uint8_t channel,

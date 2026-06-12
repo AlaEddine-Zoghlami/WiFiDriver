@@ -8,6 +8,9 @@
 #include "StationMode.h"
 #include "Dot11Frames.h"
 #include "StationTxDesc.h"
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #include "hal_com_reg.h"
 
 #include <cstring>
@@ -35,6 +38,10 @@ StationMode::StationMode(RtlUsbAdapter& dev, RadioManagementModule& rm, SendFram
     : _dev(dev), _rm(rm), _send(std::move(send)) {}
 
 void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+        "arm ENTRY: current_channel=%d", (int)_rm.current_channel());
+#endif
     // (0) **SEQUENCE FIX — IQK on the OPERATING channel.** Faithful to the kernel
     // join order (rtw_mlme_ext.c join_cmd_hdl): HW_VAR_DO_IQK(TRUE) -> set_channel_
     // bwmode(final channel) so the IQK runs on the channel we will actually use,
@@ -58,6 +65,14 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
         uint8_t off40 = (_connectWidth == CHANNEL_WIDTH_40)
                             ? _rm.prime_offset_40mhz(_rm.current_channel()) : 0;
         _rm.set_channel_bwmode(_rm.current_channel(), off40, _connectWidth);   // 20 or 40, via setConnectWidth
+        SMLOG("arm: channel=%d offset=%d width=%s", (int)_rm.current_channel(), (int)off40,
+              _connectWidth == CHANNEL_WIDTH_40 ? "40MHz" : "20MHz");
+#if defined(__ANDROID__)
+        __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+            "arm set bandwidth: ch=%d off=%d width=%s",
+            (int)_rm.current_channel(), (int)off40,
+            _connectWidth == CHANNEL_WIDTH_40 ? "40MHz" : "20MHz");
+#endif
     }
     // (1) own MAC -> REG_MACID
     for (int i = 0; i < 4; ++i) _dev.rtw_write8(REG_MACID + i, self.b[i]);
