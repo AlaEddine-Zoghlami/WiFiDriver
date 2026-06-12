@@ -214,8 +214,9 @@ public:
    * fallback. NOTE: meaningful only after the dongle is connected. */
   uint8_t GetTxPowerIndex() const;
 
-private:
+public:
   void rtw_hal_set_msr(uint8_t net_type);
+private:
   void hw_var_set_monitor();
   void PHY_SetSwChnlBWMode8812(uint8_t channel, ChannelWidth_t Bandwidth,
                                uint8_t Offset40, uint8_t Offset80);

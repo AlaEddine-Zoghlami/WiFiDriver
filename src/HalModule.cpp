@@ -71,7 +71,19 @@ bool HalModule::rtw_hal_init(SelectedChannel selectedChannel) {
 
   if (status) {
     _radioManagementModule->init_hw_mlme_ext(selectedChannel);
-    _radioManagementModule->SetMonitorMode();
+    // Init directly to STATION mode (not monitor). The firmware's internal operating
+    // mode is locked at init time. Starting in monitor mode (SetMonitorMode) and
+    // switching later (becomeStation) never transitions the firmware's internal BA
+    // engine — it stays in "bridge/monitor" mode internally, so ADDBA frames are
+    // observed but never acted on. Starting as STATION tells the firmware to process
+    // management frames through its MLME and arm the HW Block-Ack engine.
+    // DEVOURER_INIT_MONITOR=1 restores the old monitor-mode init for A/B.
+    if (std::getenv("DEVOURER_INIT_MONITOR")) {
+        _radioManagementModule->SetMonitorMode();
+    } else {
+        _radioManagementModule->rtw_hal_set_msr(0x02); // HW_STATE_STATION
+        _radioManagementModule->SetStationRxFilter();
+    }
 
     /* Construct + start the phydm DM watchdog after chip init is
      * complete. Tick once synchronously so the first canary capture
