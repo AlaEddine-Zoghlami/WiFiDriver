@@ -146,14 +146,15 @@ void RadioManagementModule::SetStationRxFilter() {
   // sniffs the stream off-air regardless of AP delivery — the pre-dd145e6 behavior that
   // worked. FORCEACK only ACKs frames matching the HW MAC filter, so AAP+FORCEACK is safe
   // and also cuts the AP's retransmits for frames it does target at us.
-  // NOTE: NO FORCEACK. dd145e6 added it to cut retransmit jitter, but HW-ACKing makes the
-  // AP treat us as a real power-save-capable station -> a Fritzbox then BUFFERS unicast
-  // (stops airing it) once we associate, so even promiscuous RX goes silent at Streaming
-  // (watchdog -> reconnect loop). Pure promiscuous monitor RX (AAP, no ACK) is the
-  // pre-dd145e6 behavior that works: we sniff everything off-air; the AP keeps airing it.
+  // Real-station RX to MATCH the kernel/phone: APM (frames to us) + FORCEACK (HW-ACK them)
+  // so the AP does NOT retransmit -> no collision loss -> clean full-rate 65Mbps delivery,
+  // exactly like the phone's kernel driver. KEEP RCR_AAP as a promiscuous sniff fallback
+  // (sniffs the stream off-air if the AP ever withholds unicast). FORCEACK only ACKs frames
+  // matching the HW MAC filter, so AAP+FORCEACK is safe. The earlier "silent at Streaming"
+  // was NOT this filter — it was the _alive dispatch guard dropping phase-1 frames (fixed).
   uint32_t rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
                  RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
-                 RCR_APPFCS;
+                 RCR_APPFCS | FORCEACK;
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
