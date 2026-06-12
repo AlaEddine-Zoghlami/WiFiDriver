@@ -655,12 +655,20 @@ struct RtlUsbAdapter::AsyncRxState {
   std::atomic<int> inflight{0};
   libusb_device_handle *dev_handle = nullptr;  // for stall recovery
   std::vector<libusb_transfer *> transfers;
-  std::vector<std::vector<uint8_t>> buffers;
-  // recv_tasklet queue: the URB callback pushes a raw recvbuf copy here and
-  // resubmits; the worker pops + parses off the event-loop thread.
+  // Zero-copy buffer pool (kernel-style): pre-allocated fixed-size buffers that
+  // are recycled between the URB callback and the worker. Eliminates the 64KB
+  // memcpy per URB completion — the kernel does the same with its skb pool.
+  static constexpr size_t POOL_BUF_SZ = 64 * 1024;
+  static constexpr int    POOL_COUNT   = 64;    // 64 × 64KB = 4MB pool
+  struct UrbBuf { uint8_t data[POOL_BUF_SZ]; };
+  std::vector<std::unique_ptr<UrbBuf>> pool;    // all buffers
+  std::vector<UrbBuf*> freeList;                // available for URB submission
+  // recv_tasklet queue: the URB callback pushes a (pointer, length) pair here —
+  // zero-copy, just a pointer — and the worker pops + parses off-loop.
+  struct QEntry { UrbBuf* buf; size_t len; };
   std::mutex qMtx;
   std::condition_variable qCv;
-  std::deque<std::vector<uint8_t>> queue;
+  std::deque<QEntry> queue;
   std::vector<std::thread> workers;  // N parallel CCMP decrypt threads (multi-core)
   std::atomic<uint64_t> rxBufs{0};        // recvbufs handed to the worker (diag)
   // While paused, the callback retires URBs WITHOUT resubmitting, so the bulk-IN
@@ -672,6 +680,7 @@ struct RtlUsbAdapter::AsyncRxState {
   // source of truth for "may I submit transfers[i]" and replaces the racy reliance
   // on the aggregate `inflight` counter (which silently drifted under double-submit).
   std::vector<std::unique_ptr<std::atomic<bool>>> submitted;
+  std::vector<UrbBuf*> transferBuf;  // parallel to transfers: which UrbBuf each URB owns
   libusb_context *ctx{nullptr};   // for actively pumping events during the drain
 };
 
@@ -681,36 +690,52 @@ struct RtlUsbAdapter::AsyncRxState {
 static void apfpv_rx_worker(RtlUsbAdapter::AsyncRxState *st) {
   FrameParser fp{st->logger};
   for (;;) {
-    std::vector<uint8_t> buf;
+    RtlUsbAdapter::AsyncRxState::QEntry qe{};
     {
       std::unique_lock<std::mutex> lk(st->qMtx);
       st->qCv.wait(lk, [st] { return !st->queue.empty() || !st->running.load(); });
       if (!st->running.load() && st->queue.empty()) break;
-      buf = std::move(st->queue.front());
+      qe = st->queue.front();
       st->queue.pop_front();
     }
     try {
-      auto pkts = fp.recvbuf2recvframe(std::span<uint8_t>{buf.data(), buf.size()});
+      auto pkts = fp.recvbuf2recvframe(std::span<uint8_t>{qe.buf->data, qe.len});
       for (auto &p : pkts) st->proc(p);
     } catch (...) {}
+    // Return buffer to free pool (kernel: return skb to free_recv_skb_queue)
+    if (qe.buf) {
+      std::lock_guard<std::mutex> lk(st->qMtx);
+      st->freeList.push_back(qe.buf);
+    }
   }
 }
 
 static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
   auto *st = static_cast<RtlUsbAdapter::AsyncRxState *>(xfer->user_data);
   if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
-    // MINIMAL inline work (rtw_enqueue_recvbuf): copy the recvbuf OUTSIDE the lock
-    // (the URB buffer is reused on resubmit, so we must copy before resubmitting),
-    // then hold qMtx only for the cheap move-enqueue. Copying under the lock made the
-    // 64KB memcpy serialize against the worker's pop -> delayed URB resubmit -> FIFO
-    // overflow during VHT bursts. Off-lock copy keeps resubmission prompt.
-    std::vector<uint8_t> tmp(xfer->buffer, xfer->buffer + xfer->actual_length);
-    {
-      std::lock_guard<std::mutex> lk(st->qMtx);
-      st->queue.emplace_back(std::move(tmp));
+    // ZERO-COPY (kernel-style): find the UrbBuf for THIS transfer, push a pointer
+    // to the work queue (no memcpy), then grab a FRESH buffer from the free list
+    // for immediate URB resubmit. Matches the kernel's skb pool: usb_read_port_complete
+    // queues the completed skb and submits a new one.
+    size_t idx = (size_t)-1;
+    for (size_t i = 0; i < st->transfers.size(); ++i)
+      if (st->transfers[i] == xfer) { idx = i; break; }
+    if (idx != (size_t)-1 && idx < st->transferBuf.size()) {
+      auto* doneBuf = st->transferBuf[idx];  // completed buffer with data
+      {
+        std::lock_guard<std::mutex> lk(st->qMtx);
+        st->queue.push_back({doneBuf, (size_t)xfer->actual_length});
+      }
+      st->rxBufs.fetch_add(1);
+      st->qCv.notify_one();
+      // Swap in a fresh buffer for this transfer before resubmit.
+      // If the free list is empty, we keep the old buffer (graceful degrade).
+      if (!st->freeList.empty()) {
+        auto* newBuf = st->freeList.back(); st->freeList.pop_back();
+        st->transferBuf[idx] = newBuf;
+        xfer->buffer = newBuf->data;
+      }
     }
-    st->rxBufs.fetch_add(1);
-    st->qCv.notify_one();
   }
   bool fatal = (xfer->status == LIBUSB_TRANSFER_CANCELLED ||
                 xfer->status == LIBUSB_TRANSFER_NO_DEVICE);
@@ -749,24 +774,32 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
   unsigned urbTo = 0;
   if (const char *e = std::getenv("DEVOURER_RX_URB_TO")) urbTo = (unsigned)std::atoi(e);
   st->ctx = *_usbCtx;                       // capture for the event-pump drain
-  st->buffers.resize(numUrbs);
   st->transfers.reserve(numUrbs);
   st->submitted.reserve(numUrbs);
-  // RX URB buffer size. 16K was too small: the RTL8812AU's USB-RX aggregation can pack
-  // several MPDUs into one bulk-IN transfer, and on some USB host controllers (notably
-  // MediaTek phones) an oversized transfer OVERFLOWS the URB and STALLs the bulk-IN
-  // endpoint. apfpv_async_rx_cb then blindly resubmits into the halted EP (no clear_halt),
-  // so RX dies — trickle/black-screen at full RTP rate while the sparse connect frames
-  // still worked. 64K holds the max aggregate so it never overflows on MTK USB hosts.
-  size_t rxBufBytes = 64 * 1024;
+  // Zero-copy buffer pool: pre-allocate POOL_COUNT fixed-size buffers. The URB
+  // callback swaps the completed buffer into the work queue and takes a fresh one
+  // for resubmit — no memcpy, exactly like the kernel's skb pool.
+  st->pool.resize(AsyncRxState::POOL_COUNT);
+  for (int i = 0; i < AsyncRxState::POOL_COUNT; ++i) {
+    st->pool[i] = std::make_unique<AsyncRxState::UrbBuf>();
+    st->freeList.push_back(st->pool[i].get());
+  }
+  // All URBs use the same buffer size (POOL_BUF_SZ = 64KB). Env-overridable.
+  size_t rxBufBytes = AsyncRxState::POOL_BUF_SZ;
   if (const char *e = std::getenv("DEVOURER_RX_BUFK")) rxBufBytes = (size_t)std::atoi(e) * 1024;
+  // Take buffers from the free list for each URB
   for (int i = 0; i < numUrbs; ++i) {
-    st->buffers[i].resize(rxBufBytes);
+    if (st->freeList.empty()) break;  // shouldn't happen: POOL_COUNT > numUrbs
+    AsyncRxState::UrbBuf* buf = st->freeList.back(); st->freeList.pop_back();
+    if (rxBufBytes > AsyncRxState::POOL_BUF_SZ) rxBufBytes = AsyncRxState::POOL_BUF_SZ;
     libusb_transfer *t = libusb_alloc_transfer(0);
-    libusb_fill_bulk_transfer(t, _dev_handle, _bulk_in_ep, st->buffers[i].data(),
-                              (int)st->buffers[i].size(), apfpv_async_rx_cb,
+    // Store the UrbBuf pointer as user_data so the callback can access it
+    t->user_data = st.get();
+    libusb_fill_bulk_transfer(t, _dev_handle, _bulk_in_ep, buf->data,
+                              (int)rxBufBytes, apfpv_async_rx_cb,
                               st.get(), urbTo);
     st->transfers.push_back(t);
+    st->transferBuf.push_back(buf);
     st->submitted.push_back(std::make_unique<std::atomic<bool>>(false));
     if (libusb_submit_transfer(t) == 0) {
       st->submitted[i]->store(true, std::memory_order_release);
@@ -790,8 +823,13 @@ void RtlUsbAdapter::stopAsyncRx() {
   // but never radiates -> arm result 3 (TXFAIL_NoAuth), looping forever. Genuine
   // URB-overflow stalls are already recovered in apfpv_async_rx_cb on resubmit
   // failure. (See memory: clear_halt-before-send was the original TX-silence bug.)
+  // Drain and recycle queued buffers (zero-copy pool: return to freeList)
+  { std::lock_guard<std::mutex> lk(st->qMtx);
+    while (!st->queue.empty()) { st->freeList.push_back(st->queue.front().buf); st->queue.pop_front(); } }
   st->qCv.notify_all();                       // wake all workers so they can exit
   for (auto &w : st->workers) if (w.joinable()) w.join();
+  // Return URB buffers back to free list
+  for (auto* buf : st->transferBuf) if (buf) st->freeList.push_back(buf);
   for (auto *t : st->transfers) libusb_free_transfer(t);
   _asyncRx.reset();
 }
