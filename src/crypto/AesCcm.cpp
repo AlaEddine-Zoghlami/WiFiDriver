@@ -152,8 +152,10 @@ static void aes_enc_ce(const AesCeKey& ce,const uint8_t in[16],uint8_t out[16]){
         "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
         "ld1 {v1.16b}, [%[pk]], #16\n\t"
         "aese v0.16b, v1.16b\n\t" "aesmc v0.16b, v0.16b\n\t"
-        "ld1 {v1.16b}, [%[pk]]\n\t"
-        "aese v0.16b, v1.16b\n\t"
+        "ld1 {v1.16b}, [%[pk]], #16\n\t"
+        "aese v0.16b, v1.16b\n\t"                         // round 10: SubBytes+ShiftRows, no MixColumns
+        "ld1 {v1.16b}, [%[pk]]\n\t"                       // rk[10]
+        "eor v0.16b, v0.16b, v1.16b\n\t"                  // FINAL AddRoundKey — was MISSING (broke every block)
         "st1 {v0.16b}, [%[out]]\n\t"
         : [pk] "+r"(rk)
         : [in] "r"(in), [out] "r"(out)

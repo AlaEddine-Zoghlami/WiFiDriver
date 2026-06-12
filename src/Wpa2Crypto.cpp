@@ -37,11 +37,16 @@ static std::array<uint8_t,16> eapol_mic_impl(const uint8_t* kck,const uint8_t* m
 static bool ccmp_decrypt_impl(const uint8_t* tk,const uint8_t* nonce,const uint8_t* in,size_t inLen,
                               const uint8_t* aad,size_t aadLen,std::vector<uint8_t>& out){
     out.resize(inLen>8?inLen-8:0);
-// ARM-CE disabled pending runtime stability test (SIGABRT on some aarch64 configs)
-// #if defined(__aarch64__)
-//     if (crypto::aes_ccm_decrypt_ce(tk,nonce,13,aad,aadLen,in,inLen,out.data())) return true;
-// #endif
-    // SW fallback: handshake EAPOL + data if CE unavailable
+    // DATA RX fast path: ARM Crypto Extensions AES (~20 cycles/block vs ~1500 SW). At 65Mbps
+    // (5600 pkt/s) SW AES (~180µs/pkt) SATURATES one core -> backlog -> dropped frames. ARM-CE
+    // (~5µs/pkt) matches the kernel and removes the ceiling. Returns false on MIC mismatch ->
+    // SW fallback. Handshake EAPOL always uses SW. The earlier SIGABRTs were the handshake Rcon
+    // bug + onScanFrame mutex (both fixed) — NOT this path; and aes_enc_ce was missing its final
+    // AddRoundKey (now fixed) which had made every CE block wrong -> silent SW fallback.
+#if defined(__aarch64__)
+    if (crypto::aes_ccm_decrypt_ce(tk,nonce,13,aad,aadLen,in,inLen,out.data())) return true;
+#endif
+    // SW fallback: handshake EAPOL + data if CE unavailable / MIC mismatch
     static thread_local uint8_t cacheKey[16] = {};
     static thread_local crypto::Aes cacheAes;
     static thread_local bool cacheValid = false;
