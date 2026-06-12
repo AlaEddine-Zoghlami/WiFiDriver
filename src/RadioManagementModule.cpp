@@ -267,6 +267,18 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
   // PHY_HandleSwChnlAndSetBW8812. Override to the PRIMARY channel so
   // current_channel() returns the correct 802.11 primary, not the center.
   if (channel != center_ch) _currentChannel = channel;
+#if defined(__ANDROID__)
+  // Verify actual bandwidth by reading the RF synthesizer and BW registers.
+  // BB 0x834[1:0]=0(20MHz),1(40MHz),2(80MHz). Also read CCK/OFDM indicator.
+  { uint32_t bb834 = phy_query_bb_reg(0x0834, 0x00000003);
+    // Read RF channel from analog register to verify primary channel
+    uint32_t rf_ch = phy_query_rf_reg(RfPath::RF_PATH_A, 0x18, 0x000000FF);
+    __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+        "RF VERIFY: wanted primary=%d off=%d bw=%s center=%d | BB834[1:0]=%d RF_CH=0x%x",
+        (int)channel, (int)channel_offset,
+        bwmode==CHANNEL_WIDTH_80?"80":bwmode==CHANNEL_WIDTH_40?"40":"20",
+        (int)center_ch, (int)bb834, (unsigned)rf_ch); }
+#endif
 }
 
 void RadioManagementModule::rtw_hal_set_chnl_bw(uint8_t channel,
