@@ -133,7 +133,13 @@ __inline static u32 _RND8(u32 sz) {
 std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   auto pbuf = ptr;
   auto pkt_cnt = GET_RX_STATUS_DESC_USB_AGG_PKTNUM_8812(pbuf.data());
-  //_logger->info("pkt_cnt == {}", pkt_cnt);
+#if defined(__ANDROID__)
+  // A-MPDU diagnostic: log aggregate size distribution every 500 URBs.
+  // If pkt_cnt is mostly 1-2, the AP sends single frames (no A-MPDU).
+  // If pkt_cnt is 5+, A-MPDU IS being used and frames are being lost downstream.
+  { static int urbN=0; urbN++;
+    if ((urbN % 500) == 0) __android_log_print(4,"rxd-agg","URB#%d subframes=%u", urbN, (unsigned)pkt_cnt); }
+#endif
 
   auto ret = std::vector<Packet>{};
 
