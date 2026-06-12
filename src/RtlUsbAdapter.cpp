@@ -91,13 +91,17 @@ RtlUsbAdapter::RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger)
 
   if (usbSpeed > LIBUSB_SPEED_HIGH) // USB 3.0
   {
-      rxagg_usb_size = 0x3; // 16KB
-      rxagg_usb_timeout = 0x01;
+      rxagg_usb_size = 0x7;    // 7×512B=3.5KB page (kernel: 0x7)
+      rxagg_usb_timeout = 0x1a; // kernel value
   } else {
-      /* the setting to reduce RX FIFO overflow on USB2.0 and increase rx
-     * throughput */
-      rxagg_usb_size = 0x1; // 8KB
-      rxagg_usb_timeout = 0x01;
+      // VHT throughput fix: the kernel uses size=0x5 (5×512B=2.5KB), timeout=0x20 (32 units)
+      // for USB 2.0 8812au. Our old values (size=0x3 timeout=0x01) had timeout 32× SHORTER,
+      // so USB DMA flushed every aggregation page nearly empty -> transfer overhead dominated
+      // -> sustained 16Mbps even at high MCS. The kernel's longer timeout fills pages before
+      // flushing -> fewer transfers -> throughput. (Source: morrownr/8812au-20210820,
+      // hal/rtl8812a/usb/usb_halinit.c: rtl8812au_interface_configure + usb_AggSettingRxUpdate_8812A)
+      rxagg_usb_size = 0x5;     // 5 × 512B = 2560B page (kernel exact value)
+      rxagg_usb_timeout = 0x20;  // 32 time units (kernel exact value — was 0x01)
   }
 
   GetChipOutEP8812();
@@ -695,11 +699,15 @@ static void apfpv_rx_worker(RtlUsbAdapter::AsyncRxState *st) {
 static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
   auto *st = static_cast<RtlUsbAdapter::AsyncRxState *>(xfer->user_data);
   if (xfer->status == LIBUSB_TRANSFER_COMPLETED && xfer->actual_length > 0) {
-    // MINIMAL inline work (rtw_enqueue_recvbuf): copy the recvbuf, hand it to the
-    // worker, then fall through to resubmit IMMEDIATELY. No parsing here.
+    // MINIMAL inline work (rtw_enqueue_recvbuf): copy the recvbuf OUTSIDE the lock
+    // (the URB buffer is reused on resubmit, so we must copy before resubmitting),
+    // then hold qMtx only for the cheap move-enqueue. Copying under the lock made the
+    // 64KB memcpy serialize against the worker's pop -> delayed URB resubmit -> FIFO
+    // overflow during VHT bursts. Off-lock copy keeps resubmission prompt.
+    std::vector<uint8_t> tmp(xfer->buffer, xfer->buffer + xfer->actual_length);
     {
       std::lock_guard<std::mutex> lk(st->qMtx);
-      st->queue.emplace_back(xfer->buffer, xfer->buffer + xfer->actual_length);
+      st->queue.emplace_back(std::move(tmp));
     }
     st->rxBufs.fetch_add(1);
     st->qCv.notify_one();

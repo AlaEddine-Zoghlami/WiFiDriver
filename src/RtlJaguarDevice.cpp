@@ -303,7 +303,10 @@ void RtlJaguarDevice::StartMonitorAsyncRx(Action_ParsedRadioPacket processor,
   _packetProcessor = processor;
   StartWithMonitorMode(channel);
   SetMonitorChannel(channel);
-  int nUrbs = 8;
+  // 24 URBs (was 8): at high VHT MCS the AP bursts an A-MPDU faster than 8 URBs can
+  // be drained/resubmitted, so the HW RX FIFO overflows and a whole burst is lost
+  // (seq jumps of ~2000+). More in-flight URBs absorb the burst -> no overflow.
+  int nUrbs = 24;
   if (const char *e = std::getenv("DEVOURER_RX_URBS")) nUrbs = std::atoi(e);
   _device.startAsyncRx(
       [this](const Packet &p) { if (_packetProcessor) _packetProcessor(p); }, nUrbs);

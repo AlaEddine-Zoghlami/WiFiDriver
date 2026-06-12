@@ -9,6 +9,9 @@
 
 #include <string.h>
 #include <vector>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 struct _phy_status_rpt_8812 {
   /*	DWORD 0*/
@@ -166,6 +169,13 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     // recvframe_put(precvframe, pattrib.pkt_len);
     /* recvframe_pull(precvframe, drvinfo_sz + RXDESC_SIZE); */
 
+#if defined(__ANDROID__)
+    // DIAG: count CRC/ICV-bad vs good frames. If crc is a large fraction, the AP's
+    // chosen MCS is too high for the link (antenna/MIMO/SNR) -> most frames dropped
+    // -> low goodput despite a high rxrate. Logged every 2000 frames.
+    { static int g=0,b=0; if (pattrib.crc_err||pattrib.icv_err) b++; else g++;
+      if (((g+b)%2000)==0) __android_log_print(4,"rxd-crc","good=%d crcbad=%d (%d%% bad)",g,b,(b*100)/(g+b)); }
+#endif
     if (pattrib.crc_err || pattrib.icv_err) {
       // Bad frame: skip ITS payload but keep walking the aggregate (do not break).
     } else if (pattrib.pkt_rpt_type ==
