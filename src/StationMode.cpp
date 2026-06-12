@@ -211,12 +211,34 @@ void StationMode::becomeStation(const MacAddr& bssid) {
 //   DEVOURER_SKIP_MACIDCFG / DEVOURER_SKIP_MEDIASTATUS / DEVOURER_SKIP_RSSI.
 void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
     (void)bssid;
-    // H2C_MACID_CFG (0x40): rate-adaptation config for the AP's MACID.
-    //   parm[0]=macid, parm[1]=raid|sgi(bit5), parm[2]=bw|flags,
-    //   parm[3..6]=rate mask (LE). 0x7fdff015 = 2.4GHz CCK+OFDM+HT MCS set.
+    // H2C_MACID_CFG / PHYDM_H2C_RA_MASK (0x40): rate-adaptation + aggregation config.
+    // Kernel PHYDM format (phydm_rainfo.c:phydm_ra_h2c): 7-byte payload with macid,
+    // rate_id, SGI, init_ra_lv, bw_mode, VHT-enable, LDPC, dis_ra, dis_pt, + 32-bit mask.
+    // The old simplified format (macid, 0xac=dis_ra=1, ...) told firmware to DISABLE RA
+    // (and implicitly Block-Ack) for this macid. The PHYDM format arms the full engine.
+    // rate_id = PHYDM_ARFR0_AC_2SS = 9 (VHT 2SS 5GHz initial rate).
+    // bw_mode = 2 (80MHz), VHT=1, LDPC=1, dis_ra=0, dis_pt=0, SGI=1, init_ra_lv=0.
+    // ra_mask = 0x3FFFFFFF (OFDM + HT-MCS 1/2SS + VHT 1SS partial, generous initial mask).
     bool h2cRa = true;
     if (!std::getenv("DEVOURER_SKIP_MACIDCFG")) {
-        uint8_t macidCfg[7] = { macid, 0xac, 0x10, 0x15, 0xf0, 0xdf, 0x7f };
+        uint8_t rate_id = 9;                // PHYDM_ARFR0_AC_2SS
+        uint8_t init_ra_lv = 0;             // initial RA level
+        uint8_t sgi = 1;                    // short guard interval supported
+        uint8_t bw_mode = 2;                // 80MHz (0=20, 1=40, 2=80)
+        uint8_t vht_en = 1;
+        uint8_t ldpc_en = 1;
+        uint8_t dis_pt = 0;
+        uint8_t dis_ra = 0;                 // THE FIX: do NOT disable RA/BA
+        uint32_t ra_mask = 0x3FFFFFFF;       // OFDM + HT 1/2SS + VHT 1SS initial
+
+        uint8_t macidCfg[7];
+        macidCfg[0] = macid;
+        macidCfg[1] = (uint8_t)((rate_id & 0x1f) | ((init_ra_lv & 0x3) << 5) | (sgi << 7));
+        macidCfg[2] = (uint8_t)(bw_mode | (ldpc_en << 2) | (vht_en << 4) | (dis_pt << 6) | (dis_ra << 7));
+        macidCfg[3] = (uint8_t)(ra_mask & 0xff);
+        macidCfg[4] = (uint8_t)((ra_mask >> 8) & 0xff);
+        macidCfg[5] = (uint8_t)((ra_mask >> 16) & 0xff);
+        macidCfg[6] = (uint8_t)((ra_mask >> 24) & 0xff);
         h2cRa = _dev.fillH2CCmd(0x40 /*H2C_MACID_CFG*/, 7, macidCfg);
     }
     // H2C_MEDIA_STATUS_RPT (0x01): MACID is now CONNECTED.
