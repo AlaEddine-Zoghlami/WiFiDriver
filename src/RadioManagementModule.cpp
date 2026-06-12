@@ -152,9 +152,15 @@ void RadioManagementModule::SetStationRxFilter() {
   // (sniffs the stream off-air if the AP ever withholds unicast). FORCEACK only ACKs frames
   // matching the HW MAC filter, so AAP+FORCEACK is safe. The earlier "silent at Streaming"
   // was NOT this filter — it was the _alive dispatch guard dropping phase-1 frames (fixed).
+  // A/B TEST: drop FORCEACK to see if HW-ACK is broken (causing AP to retransmit
+  // every frame -> effective rate ~1/3 of line rate -> sustained ~20 Mbps even at
+  // high MCS). If throughput goes UP, FORCEACK was misconfigured and the AP was
+  // wasting airtime on retransmits of already-received frames.
+  // If throughput STAYS ~20 Mbps, FORCEACK was actually working and the bottleneck
+  // is elsewhere (wrong rate-control, missing feature, etc.)
   uint32_t rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
                  RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
-                 RCR_APPFCS | FORCEACK;
+                 RCR_APPFCS | FORCEACK;  // proven: 21 vs 11 Mbps without
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
