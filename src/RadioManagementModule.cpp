@@ -251,6 +251,7 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
                 unsigned(channel_offset), (int)bwmode);
 
   center_ch = rtw_get_center_ch(channel, bwmode, channel_offset);
+  uint8_t offset40 = channel_offset;  // may be 0 for 80MHz
   if (bwmode == ChannelWidth_t::CHANNEL_WIDTH_80) {
     if (center_ch > channel) {
       chnl_offset80 = HAL_PRIME_CHNL_OFFSET_LOWER;
@@ -259,9 +260,12 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
     } else {
       chnl_offset80 = HAL_PRIME_CHNL_OFFSET_DONT_CARE;
     }
+    // Kernel also sets the 40 MHz sub-channel offset within the 80 MHz span.
+    // Without this, _cur40MhzPrimeSc=0 -> VHT subcarrier mapping fails -> black screen.
+    offset40 = prime_offset_40mhz(channel);
   }
 
-  rtw_hal_set_chnl_bw(center_ch, bwmode, channel_offset,
+  rtw_hal_set_chnl_bw(center_ch, bwmode, offset40,
                       chnl_offset80); /* set center channel */
   // _currentChannel gets set to CenterFrequencyIndex1 (= center_ch) by
   // PHY_HandleSwChnlAndSetBW8812. Override to the PRIMARY channel so
