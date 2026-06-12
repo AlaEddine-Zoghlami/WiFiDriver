@@ -11,6 +11,9 @@ extern "C" {
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 
 namespace {
 
@@ -135,20 +138,38 @@ void RadioManagementModule::rtw_hal_set_msr(uint8_t net_type) {
 }
 
 void RadioManagementModule::SetStationRxFilter() {
-  // Same bits as hw_var_set_monitor EXCEPT: (a) RCR_AAP removed — we no longer accept ALL unicast,
-  // only frames addressed to us (RCR_APM); (b) FORCEACK added — the HW now auto-ACKs those frames.
-  // Without this the chip sniffs the AP's unicast RTP but never ACKs, so the AP retransmits every
-  // frame (~37% PN-replay) and the link jitters. ICV/MIC/FCS bits unchanged so SW CCMP still decodes.
-  uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
+  // Monitor filter (promiscuous: RCR_AAP = accept ALL unicast) PLUS FORCEACK so the HW
+  // also auto-ACKs frames addressed to our MAC. KEEPING RCR_AAP is critical: an AP that
+  // does power-save buffering (e.g. a Fritzbox) only DELIVERS unicast to a station it
+  // believes is awake; our injected station never signals awake, so it would buffer the
+  // unicast RTP and we'd receive NOTHING (broadcast still floods at DTIM). Promiscuous RX
+  // sniffs the stream off-air regardless of AP delivery — the pre-dd145e6 behavior that
+  // worked. FORCEACK only ACKs frames matching the HW MAC filter, so AAP+FORCEACK is safe
+  // and also cuts the AP's retransmits for frames it does target at us.
+  // NOTE: NO FORCEACK. dd145e6 added it to cut retransmit jitter, but HW-ACKing makes the
+  // AP treat us as a real power-save-capable station -> a Fritzbox then BUFFERS unicast
+  // (stops airing it) once we associate, so even promiscuous RX goes silent at Streaming
+  // (watchdog -> reconnect loop). Pure promiscuous monitor RX (AAP, no ACK) is the
+  // pre-dd145e6 behavior that works: we sniff everything off-air; the AP keeps airing it.
+  uint32_t rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
                  RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
-                 RCR_APPFCS | FORCEACK;
+                 RCR_APPFCS;
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
-  // Read REG_RCR back to PROVE the filter stuck (a later monitor write or a failed control transfer
-  // would silently leave promiscuous/no-ACK). AAP must read 0 and FORCEACK 1 for HW ACK to work.
+  // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
+  // FORCEACK=1 (HW ACKs frames to our MAC) are both expected now.
   uint32_t rb = _device.rtw_read32(REG_RCR);
   _logger->info("[SetStationRxFilter] RCR set=0x{:08x} readback=0x{:08x} AAP={} FORCEACK={}",
                 rcr, rb, (rb & RCR_AAP) ? 1 : 0, (rb & FORCEACK) ? 1 : 0);
+#if defined(__ANDROID__)
+  // Mirror to logcat (apfpv-scan) — the spdlog _logger doesn't reach logcat. Also dump
+  // REG_MACID: the HW only RCR_APM-accepts (and FORCEACK-ACKs) unicast to THIS MAC, so it
+  // MUST equal the MAC the AP sends our leased IP to, else unicast RTP is silently dropped.
+  uint8_t m[6]; for (int i=0;i<6;i++) m[i]=_device.rtw_read8(0x0610+i);
+  __android_log_print(4, "apfpv-scan",
+    "[StationRxFilter] RCR=0x%08x AAP=%d FORCEACK=%d MACID=%02x:%02x:%02x:%02x:%02x:%02x",
+    rb, (rb&RCR_AAP)?1:0, (rb&FORCEACK)?1:0, m[0],m[1],m[2],m[3],m[4],m[5]);
+#endif
 }
 
 void RadioManagementModule::hw_var_set_monitor() {

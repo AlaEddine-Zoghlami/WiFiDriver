@@ -774,10 +774,14 @@ void RtlUsbAdapter::stopAsyncRx() {
   if (!st) return;
   st->running.store(false);
   for (auto *t : st->transfers) libusb_cancel_transfer(t);
-  // Recover a stalled RX endpoint from URB overflow at high bitrate
-  if (_bulk_in_ep) libusb_clear_halt(_dev_handle, _bulk_in_ep);
   for (int i = 0; i < 200 && st->inflight.load() > 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  // NOTE: do NOT libusb_clear_halt the bulk-IN endpoint here. On a supervisor
+  // RECONNECT, stopAsyncRx runs mid-cycle right before the re-arm; clearing the
+  // EP halt then resets USB state so the subsequent auth-req TX drains the FIFO
+  // but never radiates -> arm result 3 (TXFAIL_NoAuth), looping forever. Genuine
+  // URB-overflow stalls are already recovered in apfpv_async_rx_cb on resubmit
+  // failure. (See memory: clear_halt-before-send was the original TX-silence bug.)
   st->qCv.notify_all();                       // wake all workers so they can exit
   for (auto &w : st->workers) if (w.joinable()) w.join();
   for (auto *t : st->transfers) libusb_free_transfer(t);
