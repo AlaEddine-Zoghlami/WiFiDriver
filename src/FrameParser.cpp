@@ -137,8 +137,9 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   // A-MPDU diagnostic: log aggregate size distribution every 500 URBs.
   // If pkt_cnt is mostly 1-2, the AP sends single frames (no A-MPDU).
   // If pkt_cnt is 5+, A-MPDU IS being used and frames are being lost downstream.
-  { static int urbN=0; urbN++;
-    if ((urbN % 500) == 0) __android_log_print(4,"rxd-agg","URB#%d subframes=%u", urbN, (unsigned)pkt_cnt); }
+  { static int urbN=0, totalSub=0; urbN++; (void)totalSub;
+    // Log at end of function where ret.size() is known
+    }
 #endif
 
   auto ret = std::vector<Packet>{};
@@ -232,7 +233,15 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   if (pkt_cnt != 0) {
     _logger->info("Unprocessed packets: {}", pkt_cnt);
   }
-  //_logger->info("{} received in frame", ret.size());
+#if defined(__ANDROID__)
+  { static int urbN=0, totalFrames=0; urbN++; totalFrames += (int)ret.size();
+    if ((urbN % 250) == 0) {
+      __android_log_print(4,"rxd-agg",
+        "URB#%d pkts=%zu avg=%.1f pkt_cnt=%u",
+        urbN, ret.size(), (float)totalFrames/(float)urbN, (unsigned)pkt_cnt);
+      totalFrames = 0;
+    } }
+#endif
 
   return ret;
 }
