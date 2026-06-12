@@ -659,7 +659,7 @@ struct RtlUsbAdapter::AsyncRxState {
   // are recycled between the URB callback and the worker. Eliminates the 64KB
   // memcpy per URB completion — the kernel does the same with its skb pool.
   static constexpr size_t POOL_BUF_SZ = 64 * 1024;
-  static constexpr int    POOL_COUNT   = 64;    // 64 × 64KB = 4MB pool
+  static constexpr int    POOL_COUNT   = 256;   // 256 × 64KB = 16MB pool (rtw88 uses 512)
   struct UrbBuf { uint8_t data[POOL_BUF_SZ]; };
   std::vector<std::unique_ptr<UrbBuf>> pool;    // all buffers
   std::vector<UrbBuf*> freeList;                // available for URB submission
