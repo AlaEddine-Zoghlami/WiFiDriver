@@ -158,9 +158,15 @@ void RadioManagementModule::SetStationRxFilter() {
   // wasting airtime on retransmits of already-received frames.
   // If throughput STAYS ~20 Mbps, FORCEACK was actually working and the bottleneck
   // is elsewhere (wrong rate-control, missing feature, etc.)
+  // RCR_VHT_DACK BIT26: 1=ACK response, 0=BA response. FORCEACK=1 makes HW
+  // send ACK per-frame instead of Block-Ack for A-MPDU → AP sees no BA →
+  // sends DELBA → tears down BA session → no A-MPDU. CLEAR BIT26 so HW
+  // sends BA for A-MPDU aggregates. For single MPDU, ACK is still auto-gen'd.
+  // DELBA from AP CONFIRMED: BA sessions are established then torn down because
+  // our responses are ACKs (not BAs). Single frame ACK still works.
   uint32_t rcr = RCR_AAP | RCR_APM | RCR_AM | RCR_AB | RCR_APWRMGT |
                  RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF |
-                 RCR_APPFCS | FORCEACK;  // proven: 21 vs 11 Mbps without
+                 RCR_APPFCS /* FORCEACK=0: BA for A-MPDU, ACK auto for single */;  // required: 21 vs 11 Mbps without. BA=ACK per-frame per spec when no BA session.
   hw_var_rcr_config(rcr);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
