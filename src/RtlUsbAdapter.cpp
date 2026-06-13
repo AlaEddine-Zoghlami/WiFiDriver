@@ -17,6 +17,11 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
+#if defined(__ANDROID__)
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <linux/usbdevice_fs.h>
+#endif
 
 using namespace std::chrono_literals;
 
@@ -537,6 +542,24 @@ bool RtlUsbAdapter::send_packet(uint8_t *packet, size_t length) {
                   fwhw_txq, mcufwdl, hci_susp);
   }
 
+  // Dedicated TX: USBDEVFS_BULK ioctl directly on the usbfs fd. Bypasses the
+  // libusb event loop entirely — the kernel USB stack issues the OUT URB and
+  // interleaves it with the in-flight IN URBs at the hardware (xHCI) level.
+  // This is the fix for OUT-behind-IN serialization on Android's libusb backend.
+#if defined(__ANDROID__)
+  if (_txFd >= 0) {
+    libusb_free_transfer(transfer);
+    struct usbdevfs_bulktransfer bt;
+    std::memset(&bt, 0, sizeof(bt));
+    bt.ep = tx_ep;                   // discovered bulk-OUT endpoint addr
+    bt.len = (unsigned)length;
+    bt.timeout = 100;                // ms
+    bt.data = packet;
+    int r = TEMP_FAILURE_RETRY(::ioctl(_txFd, USBDEVFS_BULK, &bt));
+    if (r < 0) _logger->error("USBDEVFS_BULK OUT failed: {}", r);
+    return r >= 0;
+  }
+#endif
   libusb_fill_bulk_transfer(transfer, _dev_handle, tx_ep, packet, length,
                             transfer_callback, (void *)(_logger.get()),
                             USB_TIMEOUT);

@@ -37,6 +37,8 @@ enum TxSele {
 
 class RtlUsbAdapter {
   libusb_device_handle *_dev_handle;
+  int _txFd = -1;            // raw usbfs fd for direct OUT (bypasses libusb event loop)
+  uint8_t _txFdEp = 0x03;    // bulk-OUT endpoint addr for the raw-fd path
   Logger_t _logger;
 
   enum libusb_speed usbSpeed;
@@ -145,6 +147,10 @@ public:
   void pauseAsyncRx();
   void resumeAsyncRx();
   bool sendStationFrameSync(uint8_t *data, size_t len);
+  // Second libusb handle for TX-only — separate URB queue avoids OUT-behind-IN.
+  // When both handles are open, TX URBs go through the TX handle, which the
+  // kernel USB stack can interleave with IN URBs from the RX handle.
+  void setTxFd(int fd, uint8_t ep) { _txFd = fd; _txFdEp = ep; }
 
   void rtl8812au_hw_reset();
   void _8051Reset8812();
