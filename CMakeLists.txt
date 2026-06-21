@@ -36,6 +36,15 @@ file(GLOB WIFIDRIVER_SRC CONFIGURE_DEPENDS src/*.c src/*.cpp src/crypto/*.cpp)
 add_library(WiFiDriver ${WIFIDRIVER_HAL} ${WIFIDRIVER_SRC})
 target_compile_features(WiFiDriver PUBLIC cxx_std_20)
 target_include_directories(WiFiDriver PUBLIC hal hal/phydm/rtl8814a src)
+# Non-Android hosts: provide a <android/log.h> shim so the driver's logcat
+# diagnostics compile unchanged (PUBLIC -> propagates to devourer + demos).
+if(NOT ANDROID)
+    target_include_directories(WiFiDriver PUBLIC compat)
+    # Force-include the shim into every C++ TU so files that call
+    # __android_log_print without an explicit #include still resolve it.
+    # CXX-only: the HAL .c files are pure C and must not pull in <cstdio>.
+    target_compile_options(WiFiDriver PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-include;android/log.h>)
+endif()
 target_link_libraries(WiFiDriver PUBLIC PkgConfig::libusb)
 if(WIN32)
     target_link_libraries(WiFiDriver PUBLIC ws2_32 bcrypt)  # winsock (LQ/sockets) + CNG CSPRNG
