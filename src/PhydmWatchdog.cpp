@@ -37,6 +37,18 @@ constexpr auto kTickInterval = std::chrono::seconds(2);
 
 } // namespace
 
+/* Connected-mode link state (see header). Default monitor mode. */
+std::atomic<bool> PhydmWatchdog::_s_linked{false};
+std::atomic<int> PhydmWatchdog::_s_rssiDbm{-128};
+
+void PhydmWatchdog::SetLinkRssi(int rssi_dbm) {
+  _s_rssiDbm.store(rssi_dbm, std::memory_order_relaxed);
+  _s_linked.store(true, std::memory_order_relaxed);
+}
+void PhydmWatchdog::SetUnlinked() {
+  _s_linked.store(false, std::memory_order_relaxed);
+}
+
 PhydmWatchdog::PhydmWatchdog(RtlUsbAdapter device,
                              std::shared_ptr<EepromManager> eepromManager,
                              RadioManagementModule *radio, Logger_t logger)
@@ -216,11 +228,33 @@ void PhydmWatchdog::DigTick(uint32_t fa_cnt) {
   constexpr uint8_t kStepDown = 2; /* fa < kFaTh0 */
 
   /* Refresh bounds from abs_boundary_decision + dym_boundary_decision
-   * each tick (cheap, makes the !is_linked behaviour explicit). */
-  _dm_dig_max = 0x26;
-  _dm_dig_min = 0x1c;
-  _rx_gain_range_max = _dig_max_of_min;
-  _rx_gain_range_min = _dm_dig_min;
+   * each tick. Two regimes:
+   *
+   *   monitor (!is_linked, wfb-ng): coverage bounds — dm_dig_max=0x26,
+   *   floor=0x1c, ceiling=dig_max_of_min(0x2a). Keeps gain high for
+   *   long-range sensitivity at the cost of false alarms.
+   *
+   *   connected (is_linked, station): phydm connected bounds —
+   *   dm_dig_max=0x3e, dm_dig_min=0x20, and the dynamic floor tracks
+   *   RSSI: rx_gain_range_min = clamp(rssi_dBm+100, 0x20, 0x3e). The
+   *   floor-clamp below then snaps cur_ig straight to that operating
+   *   point (e.g. -45 dBm → 0x37), matching the kernel 88XXau driver
+   *   and avoiding the strong-signal over-gain that storms the FA
+   *   counter and makes the AP rate-cap us. */
+  if (_s_linked.load(std::memory_order_relaxed)) {
+    _dm_dig_max = 0x3e;
+    _dm_dig_min = 0x20;
+    int rssi_val = _s_rssiDbm.load(std::memory_order_relaxed) + 100;
+    if (rssi_val < _dm_dig_min) rssi_val = _dm_dig_min;
+    if (rssi_val > _dm_dig_max) rssi_val = _dm_dig_max;
+    _rx_gain_range_min = static_cast<uint8_t>(rssi_val);
+    _rx_gain_range_max = _dm_dig_max;
+  } else {
+    _dm_dig_max = 0x26;
+    _dm_dig_min = 0x1c;
+    _rx_gain_range_max = _dig_max_of_min;
+    _rx_gain_range_min = _dm_dig_min;
+  }
 
   uint8_t new_igi = _cur_ig_value;
   if (fa_cnt > kFaTh2) {

@@ -53,6 +53,26 @@ public:
   /* Run one watchdog cycle synchronously on the calling thread. */
   void TickOnce();
 
+  /* Link-state / RSSI hook for connected-mode DIG.
+   *
+   * Devourer's DIG defaults to phydm's *monitor-mode* (!is_linked)
+   * boundaries [0x1c, 0x2a] — correct for wfb-ng long-range RX where
+   * you trade false alarms for sensitivity. But a *station* linked to
+   * a strong local AP needs phydm's *connected-mode* boundaries
+   * [0x20, 0x3e] with the IGI floor tracking RSSI:
+   *     rx_gain_range_min = clamp(rssi_val, dm_dig_min, dm_dig_max)
+   *     rssi_val ≈ rssi_dBm + 100   (phydm 0..100 scale)
+   * so e.g. -45 dBm → IGI 0x37 — exactly what the kernel 88XXau driver
+   * converges to. With monitor bounds our IGI was clamped at 0x2a, far
+   * below 0x37: front-end over-gained → strong-signal saturation →
+   * false-alarm storm (fa≈900/2s) → OFDM CRC errors → AP rate-caps us
+   * (30 Mbps vs the kernel's 72). The station feeds its live RX RSSI
+   * here so DIG jumps the IGI floor straight to the right operating
+   * point. Static (one dongle/watchdog per process); set false/unset
+   * to restore monitor bounds for wfb-ng. */
+  static void SetLinkRssi(int rssi_dbm);
+  static void SetUnlinked();
+
   /* Most-recent FA counter snapshot — exposed for diagnostics /
    * future DIG integration. */
   struct FaCnt {
@@ -112,6 +132,12 @@ private:
    * `_digInitialised` distinguishes the first tick (which reads
    * BB 0xc50 to seed cur_ig_value) from subsequent ticks (which
    * just walk based on FA count). */
+  /* Connected-mode link state, pushed from the RX path via
+   * SetLinkRssi/SetUnlinked. _s_linked gates monitor vs connected DIG
+   * boundaries; _s_rssiDbm carries the live RX RSSI for the floor. */
+  static std::atomic<bool> _s_linked;
+  static std::atomic<int> _s_rssiDbm;
+
   bool _digInitialised = false;
   uint8_t _cur_ig_value = 0x20;
   uint8_t _dm_dig_max = 0x26;       /* DIG_MAX_COVERAGR */

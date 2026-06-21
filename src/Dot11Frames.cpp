@@ -167,11 +167,20 @@ std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
     // for this 8812 (captured via usbmon on a working wpa_supplicant connect).
     static const uint8_t tail[] = {
         0xdd,0x07, 0x00,0x50,0xf2,0x02,0x00,0x01,0x00,            // WMM Information Element
-        0x2d,0x1a, 0x2c,0x19,0x1f,0xff,0xff,                      // HT Capabilities (26B data) — byte2=0x1f (64KB A-MPDU, restored from original)
+        // HT Capabilities. A-MPDU Params byte was 0x1f = MaxLenExp 3 (64KB) + MinMPDUSpacing 7
+        // (16µs) — we advertised 16µs spacing, which makes the AP pad/cap A-MPDUs to us and holds
+        // throughput at ~30Mbps. 0x13 = MaxLenExp 3 (64KB) + MinMPDUSpacing 4 (2µs): tighter packing
+        // the 8812 RX handles, so the AP can build deep aggregates (the 30→65 lever).
+        0x2d,0x1a, 0x2c,0x19,0x13,0xff,0xff,                      // HT Capabilities — A-MPDU density 2µs (was 16µs)
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
         0xbf,0x0c, 0xa2,0x31,0xc0,0x03,0xfa,0xff,0x63,0x03,0xfa,0xff,0x63,0x03,  // VHT Caps (12B)
-        0xc7,0x01, 0x10,                                          // Operating Mode Notification
+        // Operating Mode Notification (VHT Op Mode field). THIS controls the bandwidth the AP
+        // transmits to us. The old value 0x10 = ChannelWidth[1:0]=00 (20MHz!) + RxNSS=2 — i.e. we
+        // were EXPLICITLY telling the AP "send me 20MHz", overriding the VHT-cap 80MHz and capping
+        // every data frame at bw=0 (the 27Mbps ceiling). 0x12 = ChannelWidth[1:0]=10 (80MHz) +
+        // RxNSS=2 (B4). This is THE fix for "AP sends 20MHz not 80MHz".
+        0xc7,0x01, 0x12,                                          // Operating Mode Notification: 80MHz, 2SS
         0x7f,0x08, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40        // Extended Capabilities
     };
     f.insert(f.end(), tail, tail+sizeof(tail));

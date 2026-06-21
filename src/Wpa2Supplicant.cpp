@@ -44,6 +44,7 @@ void Wpa2Supplicant::begin(const std::string& passphrase, const std::string& ssi
     // rejected by stale counters from the previous association.
     _replay = 0; _txPn = 1; _rxPnPair = 0;
     _rxPnGtk[0]=_rxPnGtk[1]=_rxPnGtk[2]=_rxPnGtk[3]=0;
+    winClear(_rxPnPairWin); for(int _k=0;_k<4;_k++) winClear(_rxPnGtkWin[_k]);
     _gtkKeyId = 0xff; _gtkPrevId = 0xff;
 }
 
@@ -56,6 +57,7 @@ void Wpa2Supplicant::beginCached(const std::array<uint8_t,32>& pmk,
     // rejected by stale counters from the previous association.
     _replay = 0; _txPn = 1; _rxPnPair = 0;
     _rxPnGtk[0]=_rxPnGtk[1]=_rxPnGtk[2]=_rxPnGtk[3]=0;
+    winClear(_rxPnPairWin); for(int _k=0;_k<4;_k++) winClear(_rxPnGtkWin[_k]);
     _gtkKeyId = 0xff; _gtkPrevId = 0xff;
 }
 
@@ -159,7 +161,7 @@ bool Wpa2Supplicant::installGtkFromKeyData(const uint8_t* body, size_t len) {
                 if (_gtkKeyId != 0xff && _gtkKeyId != newId) { _gtkPrev = _gtk; _gtkPrevId = _gtkKeyId; }
                 _gtkKeyId = newId;
                 std::memcpy(_gtk.data(), &kp[i+8], 16);
-                _rxPnGtk[newId & 3] = 0;           // fresh key: reset its RX replay window
+                _rxPnGtk[newId & 3] = 0; winClear(_rxPnGtkWin[newId & 3]);  // fresh key: reset RX replay window
                 fprintf(stderr, "[wpa] GTK installed keyid=%d (%02x%02x..)\n", _gtkKeyId, _gtk[0], _gtk[1]);
                 gotGtk = true;
             } else if (kp[i+5]==0x09 && l >= 24) {  // IGTK KDE (802.11w): <keyid LE(2)><ipn(6)> <IGTK16>
@@ -262,7 +264,7 @@ bool Wpa2Supplicant::onEapolKey(const uint8_t* body, size_t len) {
             }
             if (!hasMic && isPairwise) {                 // PTK rekey: AP restarts the 4-way
                 derivePtk(nonce);
-                _txPn = 1; _rxPnPair = 0;                // fresh pairwise key -> fresh PN windows
+                _txPn = 1; _rxPnPair = 0; winClear(_rxPnPairWin);  // fresh pairwise key -> fresh PN windows
                 _send(buildMsg2());
                 _state = State::WaitMsg3;
                 fprintf(stderr, "[wpa] PTK REKEY: re-derived PTK, sent M2 -> WaitMsg3\n");
@@ -310,12 +312,14 @@ bool Wpa2Supplicant::decryptData(const uint8_t* frame, size_t len, std::vector<u
     const uint8_t* key;
     if (frame[4] & 0x01) key = (kid == _gtkPrevId) ? _gtkPrev.data() : _gtk.data();
     else                 key = _tk.data();
-    // The RX frame carries a trailing 4-byte 802.11 FCS (the RCR appends it). It sits AFTER
-    // the CCMP MIC, so including it in the decrypt length makes the MIC check fail — this was
-    // THE data-plane bug (the SW CCM core itself is correct; it passes RFC 3610 vector #1).
-    // Try the length as-is, then minus the FCS (robust whether or not the FCS is present).
-    bool ok = _c.ccmp_decrypt(key, nonce, enc, encLen, aad, aadLen, plain);
-    if (!ok && encLen > 12) ok = _c.ccmp_decrypt(key, nonce, enc, encLen - 4, aad, aadLen, plain);
+    // The RX frame carries a trailing 4-byte 802.11 FCS (RCR APPFCS). It sits AFTER the CCMP MIC,
+    // so the FCS-INCLUSIVE length ALWAYS fails the MIC check. PERF FIX (2026-06-21): the old code
+    // tried the full length FIRST and only retried with -4 on failure — doing a WASTED full
+    // CTR+CBC-MAC decrypt on EVERY packet (the single RX worker was 93% CPU-bound, ~22Mbps cap,
+    // ~580µs/pkt). APPFCS is always on, so try the FCS-stripped length FIRST; the full-length
+    // fallback only runs if that fails (no-FCS edge case). Halves the per-packet AES work.
+    bool ok = (encLen > 12) && _c.ccmp_decrypt(key, nonce, enc, encLen - 4, aad, aadLen, plain);
+    if (!ok) ok = _c.ccmp_decrypt(key, nonce, enc, encLen, aad, aadLen, plain);
     if (!ok) {
         // MIC/CCM failure = wrong key (stale PTK/GTK after reconnect) or corrupt frame.
         static int micFails = 0;
@@ -324,22 +328,25 @@ bool Wpa2Supplicant::decryptData(const uint8_t* frame, size_t len, std::vector<u
                 "MIC-fail #%d grp=%d kid=%d (wrong key / corrupt)", micFails, (int)(frame[4]&1), (int)kid);
         return false;
     }
-    // RX anti-replay (post-MIC): the 48-bit CCMP PN must strictly increase per key, else drop.
+    // RX anti-replay (post-MIC) with a 64-PN SLIDING WINDOW. A-MPDU subframes legitimately
+    // arrive out-of-order within the Block-Ack window (bufsz=64), so the old strict
+    // "pn <= lastPn -> drop" rejected ~53% of valid reordered subframes (the real A-MPDU
+    // throughput killer once the AP started aggregating). The window accepts any in-window,
+    // not-yet-seen PN — matching how the chip/kernel do CCMP replay under aggregation.
     uint64_t pnVal = ((uint64_t)pn[0]<<40)|((uint64_t)pn[1]<<32)|((uint64_t)pn[2]<<24)
                    | ((uint64_t)pn[3]<<16)|((uint64_t)pn[4]<<8)|(uint64_t)pn[5];
-    uint64_t& lastPn = (frame[4]&0x01) ? _rxPnGtk[kid] : _rxPnPair;
-    if (pnVal <= lastPn) {
-        // PN not increasing = an 802.11 retransmit (AP re-sends until ACKed) OR a stale PN window
-        // carried across a reconnect (new key, but lastPn still holds the old session's high PN).
+    uint64_t& highest = (frame[4]&0x01) ? _rxPnGtk[kid]    : _rxPnPair;
+    uint64_t* win     = (frame[4]&0x01) ? _rxPnGtkWin[kid] : _rxPnPairWin;
+    if (!pnWindowCheck(highest, win, pnVal)) {
+        // True duplicate (an unacked-A-MPDU retransmit) or a PN below the 64-frame window.
         static int pnReplays = 0;
-        if ((++pnReplays % 200) == 1)
+        if ((++pnReplays % 500) == 1)
             __android_log_print(ANDROID_LOG_WARN, "rxd-decfail",
-                "PN-replay #%d grp=%d kid=%d pn=%llu last=%llu (retransmit or stale PN window)",
+                "PN-replay #%d grp=%d kid=%d pn=%llu high=%llu (dup or out-of-window)",
                 pnReplays, (int)(frame[4]&1), (int)kid,
-                (unsigned long long)pnVal, (unsigned long long)lastPn);
-        return false;             // replayed frame
+                (unsigned long long)pnVal, (unsigned long long)highest);
+        return false;
     }
-    lastPn = pnVal;
     return true;
 }
 

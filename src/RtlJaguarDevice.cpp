@@ -306,7 +306,13 @@ void RtlJaguarDevice::StartMonitorAsyncRx(Action_ParsedRadioPacket processor,
   // 24 URBs (was 8): at high VHT MCS the AP bursts an A-MPDU faster than 8 URBs can
   // be drained/resubmitted, so the HW RX FIFO overflows and a whole burst is lost
   // (seq jumps of ~2000+). More in-flight URBs absorb the burst -> no overflow.
-  int nUrbs = 16;  // rtw88-style: enough URBs to absorb VHT bursts (was 8)
+  // USB RX depth: the chip DMAs an A-MPDU burst into bulk-IN faster than a userspace
+  // libusb reap loop can drain+resubmit (each URB = poll wakeup + REAPURB + callback +
+  // SUBMITURB syscalls, vs the kernel's in-IRQ completion). Too few URBs in flight => the
+  // chip RX FIFO overflows mid-burst => whole A-MPDUs dropped => the AP retransmits every
+  // frame (the measured storm). The kernel keeps its ring always armed; we compensate for
+  // higher per-URB latency with MORE buffers in flight. 64 × 64KB (pool is 256).
+  int nUrbs = 64;  // was 16 — proven config (64KB each): retry 30%→4%, dups→54, gaps=0; pool=256
   if (const char *e = std::getenv("DEVOURER_RX_URBS")) nUrbs = std::atoi(e);
   _device.startAsyncRx(
       [this](const Packet &p) { if (_packetProcessor) _packetProcessor(p); }, nUrbs);

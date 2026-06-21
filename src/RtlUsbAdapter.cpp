@@ -7,6 +7,12 @@
 #else
 #include <libusb-1.0/libusb.h>
 #endif
+#if defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/usbdevice_fs.h>
+#endif
 #include "FrameParser.h"
 #include "Hal8812PhyReg.h"
 #include "logger.h"
@@ -17,7 +23,7 @@
 #include <deque>
 #include <mutex>
 #include <condition_variable>
-#if defined(__ANDROID__)
+#if defined(__ANDROID__) || defined(__linux__)
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <linux/usbdevice_fs.h>
@@ -94,19 +100,25 @@ RtlUsbAdapter::RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger)
 
   InitDvObj();
 
+#if 0  // Linux raw-fd: needs libusb fd (not separate open). Use libusb TX path.
+  { /* placeholder — raw-fd on Linux requires getting the fd from libusb */ }
+#endif
+
   if (usbSpeed > LIBUSB_SPEED_HIGH) // USB 3.0
   {
       rxagg_usb_size = 0x7;    // 7×512B=3.5KB page (kernel: 0x7)
       rxagg_usb_timeout = 0x1a; // kernel value
   } else {
-      // VHT throughput fix: the kernel uses size=0x5 (5×512B=2.5KB), timeout=0x20 (32 units)
-      // for USB 2.0 8812au. Our old values (size=0x3 timeout=0x01) had timeout 32× SHORTER,
-      // so USB DMA flushed every aggregation page nearly empty -> transfer overhead dominated
-      // -> sustained 16Mbps even at high MCS. The kernel's longer timeout fills pages before
-      // flushing -> fewer transfers -> throughput. (Source: morrownr/8812au-20210820,
-      // hal/rtl8812a/usb/usb_halinit.c: rtl8812au_interface_configure + usb_AggSettingRxUpdate_8812A)
-      rxagg_usb_size = 0x5;     // 5 × 512B = 2560B page (kernel exact value)
-      rxagg_usb_timeout = 0x20;  // 32 time units (kernel exact value — was 0x01)
+      // RX DMA aggregation. The kernel writes 0x0280=0x0520 (size=0x20,timeout=0x05), but that
+      // is tuned for the kernel's own URB management. For OUR libusb userspace path the data
+      // arrives sparse (~paced video), so the TIMEOUT dominates batching: a LONGER timeout
+      // accumulates more packets per URB. Measured: size=0x5/timeout=0x20 → 3.2 pkts/URB @ 2.2MB/s
+      // vs the kernel-exact size=0x20/timeout=0x05 → 0.9 pkts/URB @ 1.6MB/s (WORSE for us). So we
+      // intentionally DIVERGE from the kernel here and keep the long timeout. NOTE: this only
+      // affects URB batching efficiency, NOT the over-air arrival rate — the ~17Mbps paced ceiling
+      // is upstream (AP downlink at 20MHz / modest A-MPDU), not the USB DMA.
+      rxagg_usb_size = 0x5;      // 5 pages
+      rxagg_usb_timeout = 0x20;  // long timeout — best batching for our sparse userspace RX
   }
 
   GetChipOutEP8812();
@@ -681,8 +693,18 @@ struct RtlUsbAdapter::AsyncRxState {
   // Zero-copy buffer pool (kernel-style): pre-allocated fixed-size buffers that
   // are recycled between the URB callback and the worker. Eliminates the 64KB
   // memcpy per URB completion — the kernel does the same with its skb pool.
-  static constexpr size_t POOL_BUF_SZ = 64 * 1024;
-  static constexpr int    POOL_COUNT   = 256;   // 256 × 64KB = 16MB pool (rtw88 uses 512)
+  // Lever A (kernel-match): the 8812 RX FIFO is only 16KB (MAX_RX_DMA_BUFFER_SIZE_8812=0x3E80),
+  // smaller than ONE 64KB A-MPDU — the chip MUST stream to USB in real time, it can't buffer a
+  // burst. So burst tolerance comes from the DEPTH of the submitted-URB queue (the host controller
+  // advances it in HW with no userspace needed). 16KB URBs match the FIFO + DMA-agg flush exactly
+  // (a 64KB URB just completes early on a short packet and pins 48KB of waste), and let us submit
+  // FAR MORE distinct URBs within the usbfs 16MB budget: 512×16KB=8MB pool, 256 URBs in flight=4MB.
+  // EMPIRICAL (2026-06-21): 16KB URBs REGRESSED (4× more completions → reaper can't keep up →
+  // seqGaps/frame loss). LARGER URBs win in userspace: fewer reap events/syscalls per Mbps. The
+  // proven-clean config is 64KB × 64 URBs (retry 30%→4%, dups 1700→54, gaps=0). Burst tolerance
+  // comes from URB COUNT (deep HC queue), not small size.
+  static constexpr size_t POOL_BUF_SZ = 64 * 1024;  // 64KB — fewer reap events (beats 16KB)
+  static constexpr int    POOL_COUNT   = 256;       // 256 × 64KB = 16MB pool
   struct UrbBuf { uint8_t data[POOL_BUF_SZ]; };
   std::vector<std::unique_ptr<UrbBuf>> pool;    // all buffers
   std::vector<UrbBuf*> freeList;                // available for URB submission
@@ -841,13 +863,49 @@ void RtlUsbAdapter::startAsyncRx(std::function<void(const Packet &)> processor,
     st->transfers.push_back(t);
     st->transferBuf.push_back(buf);
     st->submitted.push_back(std::make_unique<std::atomic<bool>>(false));
-    if (libusb_submit_transfer(t) == 0) {
+    int subrc = libusb_submit_transfer(t);
+    if (subrc == 0) {
       st->submitted[i]->store(true, std::memory_order_release);
       st->inflight.fetch_add(1);
+    } else {
+      std::fprintf(stderr, "[rx-urb] submit %d/%d FAILED rc=%d (%s) ep=0x%02x\n",
+                   i, numUrbs, subrc, libusb_error_name(subrc), (int)_bulk_in_ep);
     }
   }
   _asyncRx = st;
   _logger->info("async RX: {} URBs in flight (+recv worker)", st->inflight.load());
+  std::fprintf(stderr, "[rx-urb] startAsyncRx numUrbs=%d inflight=%d bulkInEp=0x%02x\n",
+               numUrbs, st->inflight.load(), (int)_bulk_in_ep);
+}
+
+// Lever C.2: program a security-CAM key so the chip decrypts CCMP in HW (RX worker stays lean).
+// Format reverse-engineered from the kernel usbmon CAM writes (entry 4 = PTK, entry 5 = GTK):
+//   dword0 = (mac[1]<<24)|(mac[0]<<16)|0x8000(valid)|(sectype<<2)|keyid  [verified == kernel 0xe6508010]
+//   dword1 = mac[2..5] LE                                                 [verified == kernel 0xf3547d36]
+//   dwords2-5 = the 16-byte key ; dwords6-7 = 0.
+void RtlUsbAdapter::setSecCamKey(uint8_t entry, const uint8_t mac[6], uint8_t keyid,
+                                 const uint8_t key[16]) {
+  const uint16_t kCamWriteReg = 0x0674, kCamCmdReg = 0x0670;
+  const uint32_t kCamPoll = 0x80000000u, kCamWr = 0x00010000u;
+  const uint8_t  kAes = 4;
+  const uint8_t base = (uint8_t)(entry * 8);
+  uint32_t dw[8] = {0};
+  dw[0] = (uint32_t)keyid | ((uint32_t)kAes << 2) | 0x8000u
+        | ((uint32_t)mac[0] << 16) | ((uint32_t)mac[1] << 24);
+  dw[1] = (uint32_t)mac[2] | ((uint32_t)mac[3] << 8)
+        | ((uint32_t)mac[4] << 16) | ((uint32_t)mac[5] << 24);
+  for (int i = 0; i < 4; i++)
+    dw[2 + i] = (uint32_t)key[i*4] | ((uint32_t)key[i*4+1] << 8)
+              | ((uint32_t)key[i*4+2] << 16) | ((uint32_t)key[i*4+3] << 24);
+  for (int a = 0; a < 8; a++) {
+    rtw_write32(kCamWriteReg, dw[a]);
+    rtw_write32(kCamCmdReg, kCamPoll | kCamWr | (uint32_t)(base + a));
+    for (int p = 0; p < 50; p++) { if ((rtw_read32(kCamCmdReg) & kCamPoll) == 0) break; }
+  }
+}
+
+void RtlUsbAdapter::enableHwSec() {
+  rtw_write16(0x0680, 0x0c01);   // REG_SECCFG: enable HW TX-enc + RX-dec (kernel value)
 }
 
 void RtlUsbAdapter::stopAsyncRx() {
@@ -1010,4 +1068,35 @@ void RtlUsbAdapter::PHY_SetBBReg8812(uint16_t regAddr, uint32_t bitMask,
   rtw_write32(regAddr, data);
 
   /* RTW_INFO("BBW MASK=0x%x Addr[0x%x]=0x%x\n", BitMask, RegAddr, Data); */
+}
+
+// ============================================================================
+// rtw88 PKT H2C transport — ported from rtw88 rtw_fw_send_h2c_command()
+// ============================================================================
+// Writes a 32-byte firmware H2C packet in 4 × 8-byte chunks to successive
+// HMEBOX register pairs. Each chunk: box_ext_reg gets the upper 4 bytes,
+// box_reg gets the lower 4 bytes. Polls REG_HMETFR before each write to
+// confirm the target box is empty. Same mechanism the kernel rtw88 driver
+// uses for all firmware commands (MEDIA_STATUS_RPT, RA_INFO, RSSI, etc.).
+// ============================================================================
+bool RtlUsbAdapter::sendH2CPacket(const uint8_t h2c[32]) {
+  static const uint16_t s_boxRegs[4]   = { 0x01D0, 0x01D4, 0x01D8, 0x01DC };
+  static const uint16_t s_boxExRegs[4] = { 0x01F0, 0x01F4, 0x01F8, 0x01FC };
+
+  for (int box = 0; box < 4; box++) {
+    // Poll REG_HMETFR until this box is empty (bit(box) == 0)
+    for (int retry = 0; retry < 100; retry++) {
+      uint8_t st = rtw_read8(0x01CC);  // REG_HMETFR
+      if ((st & (1u << box)) == 0) break;
+      std::this_thread::sleep_for(1ms);
+    }
+    // Pack 8 bytes (offset box*8) into two 32-bit words
+    uint32_t w0 = (uint32_t)h2c[box*8+0] | ((uint32_t)h2c[box*8+1]<<8) |
+                  ((uint32_t)h2c[box*8+2]<<16) | ((uint32_t)h2c[box*8+3]<<24);
+    uint32_t w1 = (uint32_t)h2c[box*8+4] | ((uint32_t)h2c[box*8+5]<<8) |
+                  ((uint32_t)h2c[box*8+6]<<16) | ((uint32_t)h2c[box*8+7]<<24);
+    rtw_write32(s_boxExRegs[box], w1);
+    rtw_write32(s_boxRegs[box],   w0);
+  }
+  return true;
 }

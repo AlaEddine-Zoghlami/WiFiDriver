@@ -182,6 +182,63 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     // -> low goodput despite a high rxrate. Logged every 2000 frames.
     { static int g=0,b=0; if (pattrib.crc_err||pattrib.icv_err) b++; else g++;
       if (((g+b)%2000)==0) __android_log_print(4,"rxd-crc","good=%d crcbad=%d (%d%% bad)",g,b,(b*100)/(g+b)); }
+    // DIAG: AP's chosen TX rate/bandwidth to us. data_rate = DESC_RATE idx (VHT 1SS MCS0=44,
+    // 2SS MCS0-9=54-63), bw = 0/1/2 (20/40/80 MHz). This is the direct readout of whether the
+    // HW-BlockAck fix made the AP's rate-control climb. Histogram every 2000 good frames.
+    { static int n=0, maxrate=0, bwhi=0, bw80=0, aggFrames=0; static unsigned long bytes=0;
+      if (!(pattrib.crc_err||pattrib.icv_err)) {
+        n++; bytes += pattrib.pkt_len;
+        if (pattrib.data_rate > maxrate) maxrate = pattrib.data_rate;
+        if (pattrib.bw > bwhi) bwhi = pattrib.bw;
+        if (pattrib.bw == 2) bw80++;
+        // PAGGR (desc bit15) = this frame was part of an A-MPDU. If aggFrames stays LOW the AP
+        // sends single MPDUs (per-frame ACK) → throughput capped regardless of bandwidth; if HIGH
+        // the AP IS aggregating and the cap is elsewhere. This is the built-in "sniffer".
+        if (GET_RX_STATUS_DESC_PAGGR_8812(pbuf.data())) aggFrames++;
+        if ((n%2000)==0) {
+          __android_log_print(4,"rxd-rate","last rate=%d bw=%d | maxrate=%d maxbw=%d bw80=%d/2000 ampduFrames=%d/2000 bytes=%lu",
+              (int)pattrib.data_rate,(int)pattrib.bw,maxrate,bwhi,bw80,aggFrames,bytes);
+          maxrate=0; bwhi=0; bw80=0; aggFrames=0; bytes=0;
+        }
+      } }
+    // BA-EFFICIENCY DIAG: the decisive test for the paced-throughput ceiling. For each good QoS
+    // DATA frame, read the 802.11 Retry bit (FC bit 11) and track per-TID sequence gaps/dups.
+    //   * HIGH retry% + LOW crc%  => the AP is RE-transmitting frames we already received cleanly
+    //                                => our HW BlockAck bitmap isn't ACKing them => A-MPDU efficiency
+    //                                collapses => the ~17Mbps paced ceiling. (the BA-bitmap bug)
+    //   * seqGaps/missedSeqs       => genuine over-air loss (frames the AP sent never arrived).
+    //   * dups                     => we received a retransmit of a seq we already had.
+    { static int total=0, retried=0, gaps=0, missed=0, dups=0, inorder=0;
+      static int lastSeq[16]; static bool seqInit[16];
+      if (!(pattrib.crc_err||pattrib.icv_err) && pattrib.qos) {
+        size_t fcOff = pattrib.shift_sz + pattrib.drvinfo_sz + RXDESC_SIZE;
+        bool retry = (fcOff + 1 < pbuf.size()) && (pbuf[fcOff+1] & 0x08);
+        int tid = pattrib.priority & 0x0f;
+        int s   = pattrib.seq_num & 0xfff;
+        total++; if (retry) retried++;
+        // One-shot raw sample: dump 24 consecutive QoS frames so the seq pattern is visible
+        // (validates whether the seq field is monotonic and the retry/tid reads are sane).
+        { static int raw=0; if (raw < 24) { raw++;
+            __android_log_print(4,"rxd-ba-raw","#%d tid=%d seq=%d retry=%d fc=%02x%02x rate=%d bw=%d len=%d",
+              raw, tid, s, (int)retry,
+              (fcOff<pbuf.size())?pbuf[fcOff]:0, (fcOff+1<pbuf.size())?pbuf[fcOff+1]:0,
+              (int)pattrib.data_rate, (int)pattrib.bw, (int)pattrib.pkt_len); } }
+        if (!seqInit[tid]) { seqInit[tid]=true; lastSeq[tid]=s; }
+        else {
+          int fwd = (s - lastSeq[tid]) & 0xfff;            // forward distance mod 4096
+          if (fwd == 1) inorder++;                          // in-order, no loss
+          else if (fwd >= 2 && fwd < 2048) { gaps++; missed += (fwd-1); lastSeq[tid]=s; } // gap = missing
+          else dups++;                                      // fwd==0 or backward => retransmit/dup
+          if (fwd >= 1 && fwd < 2048) lastSeq[tid]=s;        // advance only on forward progress
+        }
+        if ((total%2000)==0) {
+          __android_log_print(4,"rxd-ba",
+            "QoS=%d inorder=%d retryBit=%d(%d%%) seqGaps=%d missedSeqs=%d dups=%d",
+            total, inorder, retried, (retried*100)/total, gaps, missed, dups);
+          total=retried=gaps=missed=dups=inorder=0;
+          for (int i=0;i<16;i++) seqInit[i]=false;
+        }
+      } }
 #endif
     if (pattrib.crc_err || pattrib.icv_err) {
       // Bad frame: skip ITS payload but keep walking the aggregate (do not break).

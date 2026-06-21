@@ -194,14 +194,20 @@ void RadioManagementModule::SetStationRxFilter() {
           RCR_ADF | RCR_ACF | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
   } else {
     rcr = RCR_APM | RCR_AM | RCR_AB | RCR_CBSSID_DATA | RCR_CBSSID_BCN |
-          RCR_HTC_LOC_CTRL | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
+          RCR_HTC_LOC_CTRL | RCR_AMF | RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK |
+          // RCR_VHT_DACK (BIT26): response type for a VHT SINGLE-MPDU data packet —
+          // 1 = reply with a normal ACK, 0 = reply with a BlockAck. The kernel sets 1
+          // (its RCR=0xce6000f4). We had it 0, so our HW answered the AP's single VHT
+          // MPDUs with a compressed BlockAck instead of the ACK the AP expects → the AP
+          // saw NO ack → retransmitted each frame to the retry limit (~5×), the measured
+          // retransmit storm that collapsed paced throughput. Match the kernel.
+          RCR_VHT_DACK;
   }
   hw_var_rcr_config(rcr);
+  // RXFLTMAP0: accept ALL management frame subtypes (auth, assoc, action, etc.)
+  _device.rtw_write16(REG_RXFLTMAP0, 0xFFFF);
   _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
   // RXFLTMAP1: accept BAR (subtype 8) + BA (subtype 9) + PS-Poll (subtype 10).
-  // The kernel default is BIT10 only (PS-Poll). Without BIT8/BIT9, the chip HW
-  // filters out BlockAckReq and BlockAck control frames. When the AP sends BAR
-  // after not seeing our SIFS-BA, the chip drops it → AP gets no BA → DELBA.
   _device.rtw_write16(REG_RXFLTMAP1, BIT8 | BIT9 | BIT10);  // BAR + BA + PS-Poll
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
   // FORCEACK=1 (HW ACKs frames to our MAC) are both expected now.

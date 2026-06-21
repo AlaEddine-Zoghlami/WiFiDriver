@@ -113,8 +113,16 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
         uint32_t rcr = RCR_APM | RCR_AM | RCR_AB | RCR_ADF | RCR_ACF |
                        RCR_CBSSID_DATA | RCR_CBSSID_BCN |
                        RCR_APP_ICV | RCR_AMF | RCR_HTC_LOC_CTRL | RCR_APP_MIC |
-                       RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK;
+                       RCR_APP_PHYST_RXFF | RCR_APPFCS | FORCEACK |
+                       // RCR_VHT_DACK (BIT26)=1: reply to VHT single-MPDU data with a normal
+                       // ACK (kernel default), not a BlockAck. With it 0 the AP got no ACK and
+                       // retransmitted every frame ~5× (measured). See RadioManagementModule.
+                       RCR_VHT_DACK;
         _dev.rtw_write32(REG_RCR, rcr);
+        // CRITICAL: accept ALL mgmt frame subtypes during arm phase.
+        // Without this, auth/assoc responses are HW-filtered.
+        _dev.rtw_write16(REG_RXFLTMAP0, 0xFFFF);
+        _dev.rtw_write16(REG_RXFLTMAP2, 0xFFFF);
     }
     // (4a) Enable HW TSF update for the STA. Faithful to the kernel's
     // rtw_iface_enable_tsf_update -> rtw_hal_set_tsf_update(1) at join, which clears
@@ -221,18 +229,27 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
     // rate_id = PHYDM_ARFR0_AC_2SS = 9 (VHT 2SS 5GHz initial rate).
     // bw_mode = 2 (80MHz), VHT=1, LDPC=1, dis_ra=0, dis_pt=0, SGI=1, init_ra_lv=0.
     // ra_mask = 0x3FFFFFFF (OFDM + HT-MCS 1/2SS + VHT 1SS partial, generous initial mask).
+    // Register-based H2C (vendor format). PKT H2C (32-byte rtw88 format) was
+    // tested, did not change BACAM_CMD=0 — the v52.14 firmware binary only
+    // accepts the register-based (HMEBOX ElementID + buffer) format.
     bool h2cRa = true;
     if (!std::getenv("DEVOURER_SKIP_MACIDCFG")) {
-        uint8_t rate_id = 9;                // PHYDM_ARFR0_AC_2SS
-        uint8_t init_ra_lv = 0;             // initial RA level
-        uint8_t sgi = 1;                    // short guard interval supported
-        uint8_t bw_mode = 2;                // 80MHz (0=20, 1=40, 2=80)
-        uint8_t vht_en = 1;
-        uint8_t ldpc_en = 1;
-        uint8_t dis_pt = 0;
-        uint8_t dis_ra = 0;                 // THE FIX: do NOT disable RA/BA
-        uint32_t ra_mask = 0x3FFFFFFF;       // OFDM + HT 1/2SS + VHT 1SS initial
-
+        // RA H2C (peer rate-adaptation config). Kernel usbmon payload = 00 a9 12 10 f0 ff ff
+        // (init_ra_lv=1, LDPC=0, ra_mask=0xfffff010). Matched init_ra_lv/LDPC to the kernel, but
+        // the aggressive VHT ra_mask is OPT-IN (DEVOURER_RA_KERNEL): forcing the top VHT-2SS rates
+        // for OUR uplink ACKs/BAs is only safe if our uplink is as strong as the AP's downlink;
+        // when it isn't, the FW picks an unreliable TX rate and the BlockAcks are lost (measured:
+        // 65Mbps run degraded with it on). The conservative mask is the safe default; the RA H2C
+        // did NOT change the AP's downlink bw=0/20MHz anyway — that's gated on the HW BlockAck.
+        uint8_t rate_id = 9; uint8_t init_ra_lv = 1; uint8_t sgi = 1;
+        uint8_t bw_mode = 2; uint8_t vht_en = 1; uint8_t ldpc_en = 0;
+        uint8_t dis_pt = 0; uint8_t dis_ra = 0;
+        // Kernel-exact ra_mask (0xfffff010): OFDM-6M fallback (bit4) + ALL HT/VHT rates incl the
+        // top VHT-2SS MCS8/9 (bits 30/31). Our old 0x3FFFFFFF included invalid 5GHz CCK (bits 0-3)
+        // AND dropped the top VHT bits — the wrong peer profile for the FW. Affects our TX-data
+        // rate only (the HW BlockAck radiates at a basic rate), so it's safe for RX video.
+        // DEVOURER_RA_CONSERVATIVE falls back to the old mask if a weak uplink needs it.
+        uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFF : 0xfffff010;
         uint8_t macidCfg[7];
         macidCfg[0] = macid;
         macidCfg[1] = (uint8_t)((rate_id & 0x1f) | ((init_ra_lv & 0x3) << 5) | (sgi << 7));
@@ -241,24 +258,17 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
         macidCfg[4] = (uint8_t)((ra_mask >> 8) & 0xff);
         macidCfg[5] = (uint8_t)((ra_mask >> 16) & 0xff);
         macidCfg[6] = (uint8_t)((ra_mask >> 24) & 0xff);
-        h2cRa = _dev.fillH2CCmd(0x40 /*H2C_MACID_CFG*/, 7, macidCfg);
+        h2cRa = _dev.fillH2CCmd(0x40, 7, macidCfg);
     }
-    // H2C_MEDIA_STATUS_RPT (0x01): MACID is now CONNECTED.
-    //   parm[0]=0x21 (opmode connect, kernel value), parm[1]=macid, parm[2]=end.
     bool h2cMs = true;
     if (!std::getenv("DEVOURER_SKIP_MEDIASTATUS")) {
         uint8_t msrParm[3] = { 0x21, macid, macid };
-        h2cMs = _dev.fillH2CCmd(0x01 /*H2C_MEDIA_STATUS_RPT*/, 3, msrParm);
+        h2cMs = _dev.fillH2CCmd(0x01, 3, msrParm);
     }
-    // H2C_RSSI_SETTING (0x42): seed rate-adaptation RSSI for the MACID.
-    //   parm[0]=macid, parm[1]=0, parm[2]=rssi(0x39 ~ good), parm[3]=0x06 stream.
     bool h2cRssi = true;
     if (!std::getenv("DEVOURER_SKIP_RSSI")) {
-        // H2C_RSSI_SETTING is a 4-byte command (kernel H2C_RSSI_SETTING_LEN=4,
-        // rtl8812_set_rssi_cmd sends len 4). Sending 7 wrote 3 ext-box bytes the
-        // firmware doesn't expect. parm = {macid, 0, rssi(0x39~good), stream(0x06)}.
         uint8_t rssiSet[4] = { macid, 0x00, 0x39, 0x06 };
-        h2cRssi = _dev.fillH2CCmd(0x42 /*H2C_RSSI_SETTING*/, 4, rssiSet);
+        h2cRssi = _dev.fillH2CCmd(0x42, 4, rssiSet);
     }
     SMLOG("station H2C: MACID_CFG=%d MEDIA_STATUS=%d RSSI=%d",
           h2cRa ? 1 : 0, h2cMs ? 1 : 0, h2cRssi ? 1 : 0);
@@ -323,6 +333,11 @@ bool StationMode::sendAuthOpenSeq1(const MacAddr& self, const MacAddr& bssid) {
     FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), TXDESC_8812,
                       mgmtMacId(), mgmtKind(),
                       mgmtRaid(_rm.current_channel()), mgmtTxRate(_rm.current_channel()));
+    if (std::getenv("DEVOURER_LOG_AUTHTX")) {
+        std::fprintf(stderr, "[authtx] mpdu %zuB:", mpdu.size());
+        for (size_t i = 0; i < mpdu.size(); ++i) std::fprintf(stderr, " %02x", mpdu[i]);
+        std::fprintf(stderr, "\n");
+    }
     return _send(frame);
 }
 
@@ -384,6 +399,30 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
     bool pauseForCal = !std::getenv("DEVOURER_NO_PAUSE_CAL");
     if (pauseForCal) _dev.pauseAsyncRx();
     arm(self, bssid);
+    // IQK CONVERGENCE-VERIFIED RETRY: the path-A TX I/Q cal converges only ~2/5 of the
+    // time (worse under USB latency, e.g. a VM's emulated xHCI), and when it falls back
+    // to the IQK-default matrix (TXiqcX=0x200, TXiqcY=0x000) the auth radiates
+    // mis-modulated and the AP can't decode it -> no auth-resp -> stuck Authenticating.
+    // Read the post-cal path-A TX-IQC and re-run the IQK (RX still paused for clean
+    // control I/O) until it converges off the default, up to a bounded number of tries.
+    auto readTxIqcX = [&]() -> uint32_t {
+        try {
+            uint32_t pc = _dev.rtw_read32(0x082c);
+            _dev.rtw_write32(0x082c, pc | 0x80000000u);   // Page C1 -> TX-IQC matrix
+            uint32_t x = _dev.rtw_read32(0x0cd4) & 0x7ff;
+            _dev.rtw_write32(0x082c, pc);
+            return x;
+        } catch (...) { return 0x200; }
+    };
+    int iqkTries = 6;
+    if (const char* e = std::getenv("DEVOURER_IQK_RETRIES")) iqkTries = atoi(e);
+    uint32_t iqcx0 = readTxIqcX();
+    fprintf(stderr, "[iqk-verify] post-arm TXiqcX=0x%03x (0x200=default/not-converged)\n", iqcx0);
+    for (int it = 0; it < iqkTries && readTxIqcX() == 0x200; ++it) {
+        fprintf(stderr, "[iqk-retry] TX-cal did not converge, re-running IQK (try %d)\n", it + 1);
+        try { _rm.RunIQK(); } catch (...) {}
+        fprintf(stderr, "[iqk-retry] -> TXiqcX=0x%03x\n", readTxIqcX());
+    }
     if (pauseForCal) _dev.resumeAsyncRx();
     // ACK-DRIVEN VERIFY: read back the RX-filter state the chip holds after arm(). The auth
     // radiates every run (FIFO=4095) yet the AP reply is missed in silent runs — a raced

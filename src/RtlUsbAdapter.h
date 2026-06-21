@@ -147,6 +147,21 @@ public:
   void pauseAsyncRx();
   void resumeAsyncRx();
   bool sendStationFrameSync(uint8_t *data, size_t len);
+  // Lever C.2 (kernel-parity HW CCMP): program one security-CAM key entry so the chip
+  // decrypts RX in hardware (RX worker then just forwards plaintext, like the kernel's
+  // lean tasklet). Format reverse-engineered from the kernel usbmon CAM writes:
+  //   entry N occupies CAM addr N*8; dword0 = (mac[1]<<24)|(mac[0]<<16)|0x8000(valid)|
+  //   (sectype<<2)|keyid ; dword1 = mac[2..5] LE ; dwords2-5 = 16-byte key ; 6-7 = 0.
+  //   write protocol: REG_CAMWRITE(0x0674)=dword, then REG_CAMCMD(0x0670)=0x80010000|addr,
+  //   poll BIT31 clear. sectype 4 = AES/CCMP.
+  void setSecCamKey(uint8_t entry, const uint8_t mac[6], uint8_t keyid,
+                    const uint8_t key[16]);
+  // Enable the HW security engine for RX decryption (REG_SECCFG 0x0680 = 0x0c01).
+  void enableHwSec();
+  // rtw88 PKT H2C: write 32-byte firmware H2C packet via HMEBOX registers.
+  // Ported from rtw88 rtw_fw_send_h2c_command(). Each 8-byte chunk goes to
+  // one HMEBOX pair (box_ext + box) after polling REG_HMETFR.
+  bool sendH2CPacket(const uint8_t h2c[32]);
   // Second libusb handle for TX-only — separate URB queue avoids OUT-behind-IN.
   // When both handles are open, TX URBs go through the TX handle, which the
   // kernel USB stack can interleave with IN URBs from the RX handle.

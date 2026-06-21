@@ -101,7 +101,13 @@ bool HalModule::rtw_hal_init(SelectedChannel selectedChannel) {
      * faster, watchdog-less path that matches kernel cold-init
      * behaviour anyway (kernel doesn't run phydm before the first
      * `iw set channel` either). */
-    if (std::getenv("DEVOURER_PHYDM_WATCHDOG")) {
+    // PHYDM DIG watchdog now DEFAULT-ON (usbmon streaming-diff finding): the kernel runs
+    // continuous DIG/AGC during A-MPDU to SUSTAIN the link — without it our RX gain is frozen
+    // at init, drifts under sustained high-rate RX, and the link degrades ("works then corrupts
+    // then stops"). The DIG tick (every 2s) adapts RX sensitivity from the false-alarm count.
+    // The old TX-contention concern was for sustained dev-dev TX; FPV is RX-heavy so the
+    // periodic BB I/O is worth the DIG maintenance. Opt-out via DEVOURER_NO_PHYDM.
+    if (!std::getenv("DEVOURER_NO_PHYDM")) {
       _phydmWatchdog = std::make_unique<PhydmWatchdog>(
           _device, _eepromManager, _radioManagementModule.get(), _logger);
       _phydmWatchdog->TickOnce();
