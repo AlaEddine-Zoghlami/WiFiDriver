@@ -2067,9 +2067,16 @@ bool HalModule::odm_config_bb_with_header_file(odm_bb_config_type config_type) {
 void HalModule::hal_set_crystal_cap(uint8_t crystal_cap) {
   crystal_cap = (uint8_t)(crystal_cap & 0x3F);
 
-  /* write 0x2C[30:25] = 0x2C[24:19] = CrystalCap */
-  _device.phy_set_bb_reg(REG_MAC_PHY_CTRL, 0x7FF80000u,
-                         (uint8_t)(crystal_cap | (crystal_cap << 6)));
+  /* 0x2C (REG_MAC_PHY_CTRL) is a MAC register — the kernel writes it via
+   * odm_set_mac_reg. The old code used phy_set_bb_reg (BB indirect path) which
+   * NEVER reached the MAC 0x2C, so the EEPROM crystal cap was never applied and
+   * the oscillator sat at the power-on default (cap 0x03) ≈ 124 kHz off the AP —
+   * smearing high-MCS RX. (It also truncated the value with a stray uint8_t cast.)
+   * Write the MAC reg directly: 0x2C[30:25] = 0x2C[24:19] = crystal_cap. */
+  uint32_t v = _device.rtw_read32(REG_MAC_PHY_CTRL);
+  v &= ~0x7FF80000u;
+  v |= ((uint32_t)crystal_cap << 25) | ((uint32_t)crystal_cap << 19);
+  _device.rtw_write32(REG_MAC_PHY_CTRL, v);
 }
 
 static uint32_t array_mp_8812a_phy_reg_mp[] = {
