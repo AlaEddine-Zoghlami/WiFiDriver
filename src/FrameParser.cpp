@@ -187,6 +187,7 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     // 2SS MCS0-9=54-63), bw = 0/1/2 (20/40/80 MHz). This is the direct readout of whether the
     // HW-BlockAck fix made the AP's rate-control climb. Histogram every 2000 good frames.
     { static int n=0, maxrate=0, bwhi=0, bw80=0, aggFrames=0; static unsigned long bytes=0;
+      static long snrSumA=0, snrSumB=0; static int snrN=0;
       if (!(pattrib.crc_err||pattrib.icv_err)) {
         n++; bytes += pattrib.pkt_len;
         if (pattrib.data_rate > maxrate) maxrate = pattrib.data_rate;
@@ -196,10 +197,18 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
         // sends single MPDUs (per-frame ACK) → throughput capped regardless of bandwidth; if HIGH
         // the AP IS aggregating and the cap is elsewhere. This is the built-in "sniffer".
         if (GET_RX_STATUS_DESC_PAGGR_8812(pbuf.data())) aggFrames++;
+        // RX SNR per path (phystatus rxsnr, dB/2). Marginal SNR at MCS8 -> PER; clean SNR -> the
+        // 5-6% retry / 2x gap is NOT reception (front-end PHYDM won't help, it's aggregation).
+        if (pattrib.physt) {
+          const struct _phy_status_rpt_8812* ps =
+              reinterpret_cast<const struct _phy_status_rpt_8812*>(pbuf.data() + RXDESC_SIZE);
+          snrSumA += ps->rxsnr[0]; snrSumB += ps->rxsnr[1]; snrN++;
+        }
         if ((n%2000)==0) {
-          __android_log_print(4,"rxd-rate","last rate=%d bw=%d | maxrate=%d maxbw=%d bw80=%d/2000 ampduFrames=%d/2000 bytes=%lu",
-              (int)pattrib.data_rate,(int)pattrib.bw,maxrate,bwhi,bw80,aggFrames,bytes);
-          maxrate=0; bwhi=0; bw80=0; aggFrames=0; bytes=0;
+          __android_log_print(4,"rxd-rate","last rate=%d bw=%d | maxrate=%d maxbw=%d bw80=%d/2000 ampduFrames=%d/2000 bytes=%lu | SNR_A=%lddB SNR_B=%lddB",
+              (int)pattrib.data_rate,(int)pattrib.bw,maxrate,bwhi,bw80,aggFrames,bytes,
+              snrN?(snrSumA/snrN)/2:0, snrN?(snrSumB/snrN)/2:0);
+          maxrate=0; bwhi=0; bw80=0; aggFrames=0; bytes=0; snrSumA=0; snrSumB=0; snrN=0;
         }
       } }
     // BA-EFFICIENCY DIAG: the decisive test for the paced-throughput ceiling. For each good QoS
