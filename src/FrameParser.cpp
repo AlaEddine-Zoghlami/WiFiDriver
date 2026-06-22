@@ -9,7 +9,7 @@
 
 #include <string.h>
 #include <vector>
-#if defined(__ANDROID__)
+#if 1 /* platform-agnostic: __android_log_print via compat shim on host */
 #include <android/log.h>
 #endif
 
@@ -133,7 +133,7 @@ __inline static u32 _RND8(u32 sz) {
 std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   auto pbuf = ptr;
   auto pkt_cnt = GET_RX_STATUS_DESC_USB_AGG_PKTNUM_8812(pbuf.data());
-#if defined(__ANDROID__)
+#if 1 /* platform-agnostic: __android_log_print via compat shim on host */
   // A-MPDU diagnostic: log aggregate size distribution every 500 URBs.
   // If pkt_cnt is mostly 1-2, the AP sends single frames (no A-MPDU).
   // If pkt_cnt is 5+, A-MPDU IS being used and frames are being lost downstream.
@@ -176,7 +176,7 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
     // recvframe_put(precvframe, pattrib.pkt_len);
     /* recvframe_pull(precvframe, drvinfo_sz + RXDESC_SIZE); */
 
-#if defined(__ANDROID__)
+#if 1 /* platform-agnostic: __android_log_print via compat shim on host */
     // DIAG: count CRC/ICV-bad vs good frames. If crc is a large fraction, the AP's
     // chosen MCS is too high for the link (antenna/MIMO/SNR) -> most frames dropped
     // -> low goodput despite a high rxrate. Logged every 2000 frames.
@@ -290,7 +290,7 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   if (pkt_cnt != 0) {
     _logger->info("Unprocessed packets: {}", pkt_cnt);
   }
-#if defined(__ANDROID__)
+#if 1 /* platform-agnostic: __android_log_print via compat shim on host */
   { static int urbN=0, totalFrames=0; urbN++; totalFrames += (int)ret.size();
     if ((urbN % 250) == 0) {
       __android_log_print(4,"rxd-agg",

@@ -21,12 +21,9 @@
 #include <cstdlib>
 #include <cstdio>
 #include "RadioManagementModule.h"
-#ifdef __ANDROID__
+// Platform-agnostic logging (NDK on Android, compat stderr shim on host builds).
 #include <android/log.h>
 #define SMLOG(...) __android_log_print(ANDROID_LOG_INFO, "apfpv-arm", __VA_ARGS__)
-#else
-#define SMLOG(...) ((void)0)
-#endif
 
 namespace apfpv {
 
@@ -272,11 +269,13 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
     }
     SMLOG("station H2C: MACID_CFG=%d MEDIA_STATUS=%d RSSI=%d",
           h2cRa ? 1 : 0, h2cMs ? 1 : 0, h2cRssi ? 1 : 0);
-#ifdef __ANDROID__
     // Hal_PatchwithJaguar_8812 (kernel: hal_com.c:4355-4363, called after
     // H2C_MEDIA_STATUS_RPT for RTL8812 in station mode). Configures VHT LSIG
     // length and BW indication for non-Jaguar AP peers. Without this the chip
-    // may mis-handle VHT A-MPDU aggregates.
+    // may mis-handle VHT A-MPDU aggregates. PLATFORM-AGNOSTIC: these are plain
+    // USB register writes — was incorrectly gated #ifdef __ANDROID__, which
+    // skipped the VHT A-MPDU patch on native Windows/Linux hosts and let the AP
+    // DELBA the session (no compressed BA for the aggregate). Apply everywhere.
     // rVhtlen_Use_Lsig_Jaguar = 0x8c3 (BB register), 0x3F for non-Jaguar AP
     _dev.rtw_write8(0x8c3, 0x3F);
     // REG_TCR (0x0604) + 3 = 0x0607: set bits 0,1,2 for VHT A-MPDU timing
@@ -285,7 +284,6 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
     // rBWIndication_Jaguar (0x834) + 3 = 0x837: clear BIT2 for non-Jaguar AP
     uint8_t bw3 = _dev.rtw_read8(0x837);
     _dev.rtw_write8(0x837, (uint8_t)(bw3 & ~0x04)); // ~BIT2
-#endif
 }
 
 // Management-frame TX rate, BAND-AWARE. Faithful to the kernel
