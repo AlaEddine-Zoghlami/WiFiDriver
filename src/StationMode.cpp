@@ -246,26 +246,48 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
         // AND dropped the top VHT bits — the wrong peer profile for the FW. Affects our TX-data
         // rate only (the HW BlockAck radiates at a basic rate), so it's safe for RX video.
         // DEVOURER_RA_CONSERVATIVE falls back to the old mask if a weak uplink needs it.
-        uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFF : 0xfffff010;
+        // ★ KERNEL-VERBATIM MACID_CFG (reconstructed from the kernel's live usbmon H2C box:
+        // payload = [00, 89, 1a, 00, 80, ff, ff]). Our prior "kernel-exact" values were WRONG —
+        // init_ra_lv=1 (s/b 0 -> byte1 0xA9 vs kernel 0x89), byte2 0x12 (s/b 0x1a, kernel sets
+        // bit3), ra_mask 0xfffff010 (s/b 0xffff8000). The firmware uses this per-peer profile to
+        // pick the rate for the compressed BA it auto-transmits; a wrong profile sends the BA at a
+        // rate the AP misses -> AP shrinks its A-MPDU + DELBAs -> the ~28Mbps cap. DEVOURER_RA_OLD
+        // restores the prior (wrong) values for A/B.
         uint8_t macidCfg[7];
-        macidCfg[0] = macid;
-        macidCfg[1] = (uint8_t)((rate_id & 0x1f) | ((init_ra_lv & 0x3) << 5) | (sgi << 7));
-        macidCfg[2] = (uint8_t)(bw_mode | (ldpc_en << 2) | (vht_en << 4) | (dis_pt << 6) | (dis_ra << 7));
-        macidCfg[3] = (uint8_t)(ra_mask & 0xff);
-        macidCfg[4] = (uint8_t)((ra_mask >> 8) & 0xff);
-        macidCfg[5] = (uint8_t)((ra_mask >> 16) & 0xff);
-        macidCfg[6] = (uint8_t)((ra_mask >> 24) & 0xff);
+        if (std::getenv("DEVOURER_RA_OLD")) {
+            uint32_t ra_mask = std::getenv("DEVOURER_RA_CONSERVATIVE") ? 0x3FFFFFFF : 0xfffff010;
+            macidCfg[0] = macid;
+            macidCfg[1] = (uint8_t)((rate_id & 0x1f) | ((init_ra_lv & 0x3) << 5) | (sgi << 7));
+            macidCfg[2] = (uint8_t)(bw_mode | (ldpc_en << 2) | (vht_en << 4) | (dis_pt << 6) | (dis_ra << 7));
+            macidCfg[3] = (uint8_t)(ra_mask & 0xff); macidCfg[4] = (uint8_t)((ra_mask >> 8) & 0xff);
+            macidCfg[5] = (uint8_t)((ra_mask >> 16) & 0xff); macidCfg[6] = (uint8_t)((ra_mask >> 24) & 0xff);
+        } else {
+            macidCfg[0] = macid;                                  // macid 0 (AP peer)
+            macidCfg[1] = 0x89;                                   // rate_id=9, init_ra_lv=0, sgi=1
+            macidCfg[2] = 0x1a;                                   // bw80 + VHT + bit3
+            macidCfg[3] = 0x00; macidCfg[4] = 0x80; macidCfg[5] = 0xff; macidCfg[6] = 0xff;  // ra_mask 0xffff8000
+        }
         h2cRa = _dev.fillH2CCmd(0x40, 7, macidCfg);
     }
     bool h2cMs = true;
-    if (!std::getenv("DEVOURER_SKIP_MEDIASTATUS")) {
+    // The kernel does NOT send H2C 0x01 (media-status) for the 8812 station (usbmon: 0 writes;
+    // MSR is set via REG_CR instead). We sent byte0=0x21 — an extra command that may park the FW
+    // peer state wrong. Default OFF now; DEVOURER_MEDIASTATUS re-enables for A/B.
+    if (std::getenv("DEVOURER_MEDIASTATUS")) {
         uint8_t msrParm[3] = { 0x21, macid, macid };
         h2cMs = _dev.fillH2CCmd(0x01, 3, msrParm);
     }
     bool h2cRssi = true;
     if (!std::getenv("DEVOURER_SKIP_RSSI")) {
-        uint8_t rssiSet[4] = { macid, 0x00, 0x39, 0x06 };
-        h2cRssi = _dev.fillH2CCmd(0x42, 4, rssiSet);
+        // Kernel-verbatim H2C_RSSI_SETTING: payload [macid, 0x00, rssi] (3 bytes); rssi ~0x2e at
+        // -54dBm. Was [macid,0,0x39,0x06] (4 bytes, static, wrong). DEVOURER_RA_OLD keeps the old.
+        if (std::getenv("DEVOURER_RA_OLD")) {
+            uint8_t rssiSet[4] = { macid, 0x00, 0x39, 0x06 };
+            h2cRssi = _dev.fillH2CCmd(0x42, 4, rssiSet);
+        } else {
+            uint8_t rssiSet[3] = { macid, 0x00, 0x2e };
+            h2cRssi = _dev.fillH2CCmd(0x42, 3, rssiSet);
+        }
     }
     SMLOG("station H2C: MACID_CFG=%d MEDIA_STATUS=%d RSSI=%d",
           h2cRa ? 1 : 0, h2cMs ? 1 : 0, h2cRssi ? 1 : 0);
