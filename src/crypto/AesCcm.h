@@ -12,8 +12,9 @@ bool aes_ccm_decrypt(const uint8_t key[16], const uint8_t* nonce, size_t nlen,
                      const uint8_t* aad, size_t aadlen,
                      const uint8_t* ct, size_t ctlen, uint8_t* out,
                      const Aes* aes_cache = nullptr);
-// ARM-CE accelerated decrypt — data RX only. Returns false to fall back to SW.
-#if defined(__aarch64__)
+// Hardware-AES accelerated decrypt — data RX only. ARM-CE on aarch64, AES-NI on
+// x86. Returns false to fall back to the SW path. Mirrors APFPV_HAVE_AES_HW in the .cpp.
+#if defined(__aarch64__) || defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 bool aes_ccm_decrypt_ce(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
                         const uint8_t* aad,size_t aadlen,
                         const uint8_t* ct,size_t ctlen,uint8_t* out);

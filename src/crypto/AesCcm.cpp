@@ -1,6 +1,14 @@
 // Self-contained AES-128 + CCM (CCMP: M=8, L=2). Public-domain style AES core.
 #include "AesCcm.h"
 #include <cstring>
+// x86 AES-NI intrinsics (must be included at file scope, NOT inside a namespace).
+// Gives native Windows/Linux x86 hosts the same hardware AES the ARM phone gets
+// from ARM-CE — without it, software AES runs ~8x slower (355us vs ~10us/pkt) and
+// caps CCMP-decrypt throughput well below line rate.
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#define APFPV_X86_AESNI 1
+#endif
 namespace apfpv { namespace crypto {
 
 static const uint8_t S[256]={
@@ -114,6 +122,7 @@ bool aes_ccm_decrypt(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
 }
 
 #if defined(__aarch64__)
+#define APFPV_HAVE_AES_HW 1
 // ARM-CE accelerated decrypt — data RX only (NOT handshake).
 // Uses inline ASM AESE/AESMC. Separate from SW AES above so the
 // EAPOL/4-way handshake always uses the proven SW implementation.
@@ -162,11 +171,61 @@ static void aes_enc_ce(const AesCeKey& ce,const uint8_t in[16],uint8_t out[16]){
         : "v0","v1","v16","cc","memory"
     );
 }
-// Data RX only: try ARM-CE decrypt. Returns false to fall back to SW.
+#elif defined(APFPV_X86_AESNI)
+#define APFPV_HAVE_AES_HW 1
+// x86 AES-NI accelerated decrypt — data RX only (NOT handshake), mirrors the
+// ARM-CE path. Same CCM logic; only the block cipher uses AES-NI intrinsics.
+#if defined(__GNUC__)
+#define APFPV_AES_TGT __attribute__((target("aes,sse2")))
+#else
+#define APFPV_AES_TGT
+#endif
+struct AesCeKey { __m128i rk[11]; };
+APFPV_AES_TGT static inline __m128i x86_kexp(__m128i key, __m128i kga){
+    kga = _mm_shuffle_epi32(kga, _MM_SHUFFLE(3,3,3,3));
+    key = _mm_xor_si128(key, _mm_slli_si128(key,4));
+    key = _mm_xor_si128(key, _mm_slli_si128(key,4));
+    key = _mm_xor_si128(key, _mm_slli_si128(key,4));
+    return _mm_xor_si128(key, kga);
+}
+APFPV_AES_TGT static void aes_ce_expand(const uint8_t k[16], AesCeKey& ce){
+    ce.rk[0]=_mm_loadu_si128(reinterpret_cast<const __m128i*>(k));
+    ce.rk[1]=x86_kexp(ce.rk[0],_mm_aeskeygenassist_si128(ce.rk[0],0x01));
+    ce.rk[2]=x86_kexp(ce.rk[1],_mm_aeskeygenassist_si128(ce.rk[1],0x02));
+    ce.rk[3]=x86_kexp(ce.rk[2],_mm_aeskeygenassist_si128(ce.rk[2],0x04));
+    ce.rk[4]=x86_kexp(ce.rk[3],_mm_aeskeygenassist_si128(ce.rk[3],0x08));
+    ce.rk[5]=x86_kexp(ce.rk[4],_mm_aeskeygenassist_si128(ce.rk[4],0x10));
+    ce.rk[6]=x86_kexp(ce.rk[5],_mm_aeskeygenassist_si128(ce.rk[5],0x20));
+    ce.rk[7]=x86_kexp(ce.rk[6],_mm_aeskeygenassist_si128(ce.rk[6],0x40));
+    ce.rk[8]=x86_kexp(ce.rk[7],_mm_aeskeygenassist_si128(ce.rk[7],0x80));
+    ce.rk[9]=x86_kexp(ce.rk[8],_mm_aeskeygenassist_si128(ce.rk[8],0x1b));
+    ce.rk[10]=x86_kexp(ce.rk[9],_mm_aeskeygenassist_si128(ce.rk[9],0x36));
+}
+APFPV_AES_TGT static void aes_enc_ce(const AesCeKey& ce,const uint8_t in[16],uint8_t out[16]){
+    __m128i m=_mm_loadu_si128(reinterpret_cast<const __m128i*>(in));
+    m=_mm_xor_si128(m,ce.rk[0]);
+    m=_mm_aesenc_si128(m,ce.rk[1]); m=_mm_aesenc_si128(m,ce.rk[2]);
+    m=_mm_aesenc_si128(m,ce.rk[3]); m=_mm_aesenc_si128(m,ce.rk[4]);
+    m=_mm_aesenc_si128(m,ce.rk[5]); m=_mm_aesenc_si128(m,ce.rk[6]);
+    m=_mm_aesenc_si128(m,ce.rk[7]); m=_mm_aesenc_si128(m,ce.rk[8]);
+    m=_mm_aesenc_si128(m,ce.rk[9]);
+    m=_mm_aesenclast_si128(m,ce.rk[10]);
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(out),m);
+}
+#endif
+
+#ifdef APFPV_HAVE_AES_HW
+// Data RX only: hardware-AES CCMP decrypt (ARM-CE or x86 AES-NI). Returns false
+// to fall back to the SW path (e.g. an x86 CPU lacking AES-NI). Only aes_enc_ce
+// differs per-arch; the CCM (CTR + CBC-MAC) logic below is shared.
 bool aes_ccm_decrypt_ce(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
                         const uint8_t* aad,size_t aadlen,
                         const uint8_t* ct,size_t ctlen,uint8_t* out){
     if(ctlen<8) return false;
+#if defined(APFPV_X86_AESNI) && defined(__GNUC__)
+    static const bool kHasAesNi = __builtin_cpu_supports("aes");
+    if(!kHasAesNi) return false;   // no AES-NI on this x86 CPU -> SW fallback
+#endif
     // TLS cache per worker thread
     static thread_local uint8_t ck[16]={}; static thread_local AesCeKey ce; static thread_local bool ok=false;
     if(!ok||memcmp(ck,key,16)!=0){ aes_ce_expand(key,ce); memcpy(ck,key,16); ok=true; }
