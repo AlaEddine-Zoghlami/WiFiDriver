@@ -117,8 +117,16 @@ RtlUsbAdapter::RtlUsbAdapter(libusb_device_handle *dev_handle, Logger_t logger)
       // intentionally DIVERGE from the kernel here and keep the long timeout. NOTE: this only
       // affects URB batching efficiency, NOT the over-air arrival rate — the ~17Mbps paced ceiling
       // is upstream (AP downlink at 20MHz / modest A-MPDU), not the USB DMA.
-      rxagg_usb_size = 0x5;      // 5 pages
-      rxagg_usb_timeout = 0x20;  // long timeout — best batching for our sparse userspace RX
+      // size=0x5/timeout=0x20 (long timeout) is OPTIMAL for our libusb path: it batches more
+      // packets per URB so the reaper keeps up. TESTED 2026-06-22: kernel-exact size=0x20/
+      // timeout=0x05 REGRESSED hard (22Mbps, missedSeqs 1284, dups 1316) — the chip flushes tiny
+      // transfers our userspace reaper can't drain → loss. RX-DMA agg is NOT the BA lever.
+      // DEVOURER_RXAGG="size,to" (hex) overrides for experimentation.
+      rxagg_usb_size = 0x5;      // 5 pages — best for userspace reaper
+      rxagg_usb_timeout = 0x20;  // long timeout — best batching for our libusb RX
+      if (const char *e = std::getenv("DEVOURER_RXAGG")) {
+          int s=0,t=0; if (sscanf(e, "%x,%x", &s, &t) == 2) { rxagg_usb_size=(uint8_t)s; rxagg_usb_timeout=(uint8_t)t; }
+      }
   }
 
   GetChipOutEP8812();
