@@ -1,4 +1,5 @@
 #include "Iqk8812a.h"
+#include <android/log.h>   // NDK on Android, compat stderr shim on host builds
 
 #include "Hal8812PhyReg.h"
 #include "RadioManagementModule.h"
@@ -577,25 +578,46 @@ void Iqk8812a::DoTxRxCalibration(uint8_t chnl_idx, BandType band) {
   _logger->debug("Iqk8812a RX: A_done={} B_done={} A_retry={} B_retry={}",
                  unsigned(RX0_finish), unsigned(RX1_finish),
                  unsigned(cal0_retry), unsigned(cal1_retry));
+  // Visible on native (shim). RX0/RX1_finish=0 -> RX IQK didn't converge -> we fall back to
+  // bypass (0xc10/0xe10=0x100) -> uncompensated RX IQ imbalance -> degraded 2SS -> AP uses 1SS.
+  __android_log_print(4, "apfpv-scan",
+    "IQK-RESULT: TX_A=%u TX_B=%u RX_A=%u RX_B=%u rxavg=%d/%d retry=%d/%d | RX_IQC A[%d,%d] B[%d,%d]",
+    unsigned(TX0_finish), unsigned(TX1_finish), unsigned(RX0_finish), unsigned(RX1_finish),
+    rx0_average, rx1_average, cal0_retry, cal1_retry,
+    RX_IQC[0], RX_IQC[1], RX_IQC[2], RX_IQC[3]);
 
-  /* Fill IQK results — defaults for paths that didn't converge. */
+  /* Fill IQK results. On convergence, apply AND cache. On failure, re-apply the
+   * cached good result (if any) rather than the bypass default — a failed re-IQK
+   * must NOT clobber the good RX-IQ compensation (else 2SS RX dies). */
   if (TX0_finish) {
+    _cachedTxIqc[0] = TX_IQC[0]; _cachedTxIqc[1] = TX_IQC[1]; _cachedTx0 = true;
     FillTxIqc(RfPath::RF_PATH_A, TX_IQC[0], TX_IQC[1]);
+  } else if (_cachedTx0) {
+    FillTxIqc(RfPath::RF_PATH_A, _cachedTxIqc[0], _cachedTxIqc[1]);
   } else {
     FillTxIqc(RfPath::RF_PATH_A, 0x200, 0x0);
   }
   if (RX0_finish) {
+    _cachedRxIqc[0] = RX_IQC[0]; _cachedRxIqc[1] = RX_IQC[1]; _cachedRx0 = true;
     FillRxIqc(RfPath::RF_PATH_A, RX_IQC[0], RX_IQC[1]);
+  } else if (_cachedRx0) {
+    FillRxIqc(RfPath::RF_PATH_A, _cachedRxIqc[0], _cachedRxIqc[1]);
   } else {
     FillRxIqc(RfPath::RF_PATH_A, 0x200, 0x0);
   }
   if (TX1_finish) {
+    _cachedTxIqc[2] = TX_IQC[2]; _cachedTxIqc[3] = TX_IQC[3]; _cachedTx1 = true;
     FillTxIqc(RfPath::RF_PATH_B, TX_IQC[2], TX_IQC[3]);
+  } else if (_cachedTx1) {
+    FillTxIqc(RfPath::RF_PATH_B, _cachedTxIqc[2], _cachedTxIqc[3]);
   } else {
     FillTxIqc(RfPath::RF_PATH_B, 0x200, 0x0);
   }
   if (RX1_finish) {
+    _cachedRxIqc[2] = RX_IQC[2]; _cachedRxIqc[3] = RX_IQC[3]; _cachedRx1 = true;
     FillRxIqc(RfPath::RF_PATH_B, RX_IQC[2], RX_IQC[3]);
+  } else if (_cachedRx1) {
+    FillRxIqc(RfPath::RF_PATH_B, _cachedRxIqc[2], _cachedRxIqc[3]);
   } else {
     FillRxIqc(RfPath::RF_PATH_B, 0x200, 0x0);
   }

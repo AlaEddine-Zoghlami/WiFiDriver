@@ -67,6 +67,15 @@ private:
   RadioManagementModule *_radio;
   Logger_t _logger;
 
+  // Cache of the last SUCCESSFUL IQK result per path. The first IQK (device quiet)
+  // converges with good values; later re-calibrations (post-assoc 80MHz retune, etc.)
+  // run while the device is busy and fail (retry=10) — and the old code then wrote the
+  // bypass default (0x200/0x0), CLOBBERING the good RX-IQ compensation → degraded 2SS
+  // RX → AP halves us to 1SS. On failure we now re-apply the cached good result instead.
+  int _cachedTxIqc[4]{};
+  int _cachedRxIqc[4]{};
+  bool _cachedTx0 = false, _cachedTx1 = false, _cachedRx0 = false, _cachedRx1 = false;
+
   static constexpr int kMacBbRegNum = 9;
   static constexpr int kAfeRegNum = 12;
   static constexpr int kRfRegNum = 3;
