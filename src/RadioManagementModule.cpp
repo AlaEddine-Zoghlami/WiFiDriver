@@ -202,6 +202,13 @@ void RadioManagementModule::SetStationRxFilter() {
           // saw NO ack → retransmitted each frame to the retry limit (~5×), the measured
           // retransmit storm that collapsed paced throughput. Match the kernel.
           RCR_VHT_DACK;
+    // "Keep the frames for the HW": the live kernel RCR (0xf40060ce) also sets
+    // RCR_APP_MIC (BIT30) + RCR_APP_ICV (BIT29) — the MAC RETAINS the MIC/ICV at the
+    // bottom of each RX'd frame instead of stripping them. We were stripping (0x940060ce).
+    // Test whether the HW's station RX engine / BA-arming needs the frame kept intact.
+    // Opt-in (DEVOURER_RCR_APP) since retaining ICV/MIC may add trailing bytes our SW-CCMP
+    // path must tolerate; default off to avoid breaking decrypt.
+    if (std::getenv("DEVOURER_RCR_APP")) rcr |= (1u << 30) | (1u << 29);
   }
   hw_var_rcr_config(rcr);
   // RXFLTMAP0: accept ALL management frame subtypes (auth, assoc, action, etc.)
