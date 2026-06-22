@@ -6,6 +6,7 @@
 
 #include "basic_types.h"
 #include "rtl8812a_recv.h"
+#include "PhydmWatchdog.h"
 
 #include <string.h>
 #include <vector>
@@ -265,6 +266,13 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
        * 8814AU. */
       ret.back().RxAtrib.snr[2] = static_cast<int8_t>(driver_data.csi_current[0]);
       ret.back().RxAtrib.snr[3] = static_cast<int8_t>(driver_data.csi_current[1]);
+      /* CFO-tracking feed (phydm_cfo_tracking): only OFDM/HT/VHT (data_rate>=4;
+       * CCK reuses these phystatus bytes for AGC). The watchdog averages the
+       * path-A/B CFO tail and steps the crystal cap to null the carrier-freq
+       * offset — cuts the dense-MCS8 RX PER that makes the AP throttle our A-MPDU. */
+      if (pattrib.physt && pattrib.data_rate >= 4) {
+        PhydmWatchdog::AddCfo(driver_data.cfotail[0], driver_data.cfotail[1]);
+      }
     } else {
       /* pkt_rpt_type == TX_REPORT1-CCX, TX_REPORT2-TX RTP,HIS_REPORT-USB HISR
        * RTP */

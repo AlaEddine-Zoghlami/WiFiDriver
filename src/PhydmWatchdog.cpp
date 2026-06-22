@@ -1,6 +1,7 @@
 #include "PhydmWatchdog.h"
 
 #include "RadioManagementModule.h"
+#include <android/log.h>   // NDK on Android, compat stderr shim on host (see WiFiDriver/compat)
 
 #include <algorithm>
 #include <chrono>
@@ -47,6 +48,19 @@ void PhydmWatchdog::SetLinkRssi(int rssi_dbm) {
 }
 void PhydmWatchdog::SetUnlinked() {
   _s_linked.store(false, std::memory_order_relaxed);
+}
+
+/* CFO tracking accumulators (fed per-RX-packet from FrameParser). */
+std::atomic<int> PhydmWatchdog::_s_cfo_sum[2]{};
+std::atomic<unsigned> PhydmWatchdog::_s_cfo_cnt[2]{};
+std::atomic<unsigned> PhydmWatchdog::_s_cfo_pkt{0};
+
+void PhydmWatchdog::AddCfo(int cfo_a, int cfo_b) {
+  _s_cfo_sum[0].fetch_add(cfo_a, std::memory_order_relaxed);
+  _s_cfo_cnt[0].fetch_add(1, std::memory_order_relaxed);
+  _s_cfo_sum[1].fetch_add(cfo_b, std::memory_order_relaxed);
+  _s_cfo_cnt[1].fetch_add(1, std::memory_order_relaxed);
+  _s_cfo_pkt.fetch_add(1, std::memory_order_relaxed);
 }
 
 PhydmWatchdog::PhydmWatchdog(RtlUsbAdapter device,
@@ -110,6 +124,12 @@ void PhydmWatchdog::TickOnce() {
     _digInitialised = true;
   }
   DigTick(fa.cnt_all);
+
+  /* CFO tracking (phydm_cfo_tracking port). Opt-in — a wrong crystal cap
+   * detunes the radio, so gate it until validated. */
+  if (std::getenv("DEVOURER_CFO_TRACK")) {
+    CfoTick();
+  }
 }
 
 void PhydmWatchdog::ReadFaCountersAc(FaCnt &out) {
@@ -305,4 +325,75 @@ void PhydmWatchdog::DigWriteIgi(uint8_t igi) {
   _device.phy_set_bb_reg(0xe50, 0xff, igi); /* path B — rB_IGI_Jaguar */
   _device.phy_set_bb_reg(0x1850, 0xff, igi); /* path C — 8814 only */
   _device.phy_set_bb_reg(0x1a50, 0xff, igi); /* path D — 8814 only */
+}
+
+void PhydmWatchdog::SetCrystalCap(uint8_t crystal_cap) {
+  /* 8812: REG 0x2C bits[30:25] = bits[24:19] = crystal_cap (6-bit). Read-
+   * modify-write the MAC reg. (phydm_set_crystal_cap_reg, 8812 branch.) */
+  crystal_cap &= 0x3f;
+  uint32_t v = _device.rtw_read32(0x2c);
+  v &= ~0x7FF80000u;
+  v |= ((uint32_t)crystal_cap << 25) | ((uint32_t)crystal_cap << 19);
+  _device.rtw_write32(0x2c, v);
+  _crystal_cap = crystal_cap;
+}
+
+void PhydmWatchdog::CfoTick() {
+  /* Port of phydm_cfo_tracking (phydm_cfotracking.c:370). Average the per-path
+   * CFO tail accumulated from RX phystatus, then step the crystal cap +/-1 to
+   * keep |CFO| under the stop threshold (10kHz), with a 20kHz enable hysteresis. */
+  if (!_cfo_inited) {
+    uint32_t v = _device.rtw_read32(0x2c);
+    _crystal_cap = (uint8_t)((v >> 25) & 0x3f);   /* current bits[30:25] */
+    _crystal_cap_def = _crystal_cap;
+    _cfo_inited = true;
+    _logger->info("CfoTrack init crystal_cap=0x{:02x}", unsigned(_crystal_cap));
+  }
+  /* Only track on a live single-peer link (matches is_linked & one_entry_only). */
+  if (!_s_linked.load(std::memory_order_relaxed)) return;
+
+  unsigned pkt = _s_cfo_pkt.load(std::memory_order_relaxed);
+  if (pkt == _cfo_pkt_pre) return;   /* no new packets this interval */
+  _cfo_pkt_pre = pkt;
+
+  /* CFO_HW_RPT_2_KHZ(v) = (v<<1)+(v>>1) = v*2.5. Average per path, keep sign. */
+  int cfo_path_sum = 0, valid = 0;
+  for (int i = 0; i < 2; i++) {
+    unsigned cnt = _s_cfo_cnt[i].exchange(0, std::memory_order_relaxed);
+    int sum = _s_cfo_sum[i].exchange(0, std::memory_order_relaxed);
+    if (cnt == 0) continue;
+    valid++;
+    int a = sum < 0 ? -sum : sum;
+    int khz = ((a << 1) + (a >> 1)) / (int)cnt;
+    cfo_path_sum += (sum < 0) ? -khz : khz;
+  }
+  if (valid == 0) return;
+  int cfo_avg = (valid >= 2) ? cfo_path_sum / valid : cfo_path_sum;
+
+  __android_log_print(4, "apfpv-scan", "CfoTrack: cfo_avg=%dkHz paths=%d cap=0x%02x adjust=%d (pkts=%u)",
+                      cfo_avg, valid, (unsigned)_crystal_cap, _cfo_is_adjust ? 1 : 0, pkt - 0);
+
+  if (!_cfo_is_adjust) {
+    if (cfo_avg > 20 || cfo_avg < -20) _cfo_is_adjust = true;   /* CFO_TRK_ENABLE_TH */
+  } else {
+    if (cfo_avg < 10 && cfo_avg > -10) _cfo_is_adjust = false;  /* CFO_TRK_STOP_TH */
+  }
+  if (_cfo_is_adjust) {
+    int cap = _crystal_cap;
+    // The kernel steps +/-1 per tick because its crystal cap starts factory-correct
+    // (~0 CFO). Ours can start far off (e.g. 124kHz when 0x2C was clobbered to a low
+    // cap), so converge proportionally — ~3.3kHz per cap step on the 8812 — to reach
+    // the <10kHz lock in a few ticks instead of ~2 minutes.
+    int absavg = cfo_avg < 0 ? -cfo_avg : cfo_avg;
+    int step = absavg > 60 ? 8 : absavg > 30 ? 4 : absavg > 15 ? 2 : 1;
+    if (cfo_avg > 10) cap += step;
+    else if (cfo_avg < -10) cap -= step;
+    if (cap > 0x3f) cap = 0x3f;
+    if (cap < 0) cap = 0;
+    if ((uint8_t)cap != _crystal_cap) {
+      _logger->info("CfoTrack cfo_avg={}kHz cap 0x{:02x}->0x{:02x}",
+                    cfo_avg, unsigned(_crystal_cap), unsigned(cap));
+      SetCrystalCap((uint8_t)cap);
+    }
+  }
 }

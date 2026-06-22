@@ -73,6 +73,16 @@ public:
   static void SetLinkRssi(int rssi_dbm);
   static void SetUnlinked();
 
+  /* CFO (carrier-frequency-offset) tracking — port of phydm_cfo_tracking.
+   * Fed per-RX-packet from FrameParser with the phystatus path-A/B CFO tail
+   * (s8, s(8,7)); the watchdog averages it each tick and steps the crystal cap
+   * (REG 0x2C) by +/-1 to pull |CFO| under 10kHz. Our oscillator drifts vs the
+   * AP's; uncorrected CFO smears the dense MCS8 constellation → ~5-9% RX PER
+   * (kernel <1%) → the AP throttles our A-MPDU. We ported only DIG before; this
+   * is the missing piece. Gated DEVOURER_CFO_TRACK (opt-in) for safe A/B since a
+   * bad cap detunes the radio. Static: one dongle/watchdog per process. */
+  static void AddCfo(int cfo_a, int cfo_b);
+
   /* Most-recent FA counter snapshot — exposed for diagnostics /
    * future DIG integration. */
   struct FaCnt {
@@ -111,6 +121,9 @@ private:
   void DigInit();
   void DigTick(uint32_t fa_cnt);
   void DigWriteIgi(uint8_t igi);
+  /* CFO tracking (phydm_cfo_tracking port) — runs each watchdog tick. */
+  void CfoTick();
+  void SetCrystalCap(uint8_t crystal_cap);
 
   RtlUsbAdapter _device;
   std::shared_ptr<EepromManager> _eepromManager;
@@ -137,6 +150,17 @@ private:
    * boundaries; _s_rssiDbm carries the live RX RSSI for the floor. */
   static std::atomic<bool> _s_linked;
   static std::atomic<int> _s_rssiDbm;
+
+  /* CFO tracking state. Accumulators are static (fed from the RX thread via
+   * AddCfo); the rest is per-watchdog. */
+  static std::atomic<int> _s_cfo_sum[2];   /* signed CFO-tail sum, path A/B */
+  static std::atomic<unsigned> _s_cfo_cnt[2];
+  static std::atomic<unsigned> _s_cfo_pkt; /* total packet count */
+  unsigned _cfo_pkt_pre = 0;
+  bool _cfo_inited = false;
+  bool _cfo_is_adjust = false;
+  uint8_t _crystal_cap = 0;
+  uint8_t _crystal_cap_def = 0;
 
   bool _digInitialised = false;
   uint8_t _cur_ig_value = 0x20;
