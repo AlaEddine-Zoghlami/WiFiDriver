@@ -211,11 +211,23 @@ void RadioManagementModule::SetStationRxFilter() {
     if (std::getenv("DEVOURER_RCR_APP")) rcr |= (1u << 30) | (1u << 29);
   }
   hw_var_rcr_config(rcr);
-  // RXFLTMAP0: accept ALL management frame subtypes (auth, assoc, action, etc.)
-  _device.rtw_write16(REG_RXFLTMAP0, 0xFFFF);
-  _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
-  // RXFLTMAP1: accept BAR (subtype 8) + BA (subtype 9) + PS-Poll (subtype 10).
-  _device.rtw_write16(REG_RXFLTMAP1, BIT8 | BIT9 | BIT10);  // BAR + BA + PS-Poll
+  // TEST 2 (DEVOURER_T2_KFLT): match the kernel's RX filter EXACTLY. The kernel leaves RXFLTMAP0
+  // at chip default (does NOT flush all mgmt to host) and sets RXFLTMAP1 = BIT8|BIT10 (BAR + PS-Poll,
+  // NOT the BA subtype) — i.e. it lets the HW keep/own more of the mgmt+control frames instead of
+  // DMAing them to the host. Tests whether our over-open filter ("flushing") is why the HW doesn't
+  // own the BA. Default keeps our permissive filter.
+  if (std::getenv("DEVOURER_T2_KFLT")) {
+    // do NOT touch RXFLTMAP0 (leave chip default, like the kernel) — but we still need action
+    // frames for our SW ADDBA; the chip default accepts them. RXFLTMAP1 = kernel 0x0500.
+    _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);
+    _device.rtw_write16(REG_RXFLTMAP1, BIT8 | BIT10);  // kernel: BAR + PS-Poll only (no BA flush)
+  } else {
+    // RXFLTMAP0: accept ALL management frame subtypes (auth, assoc, action, etc.)
+    _device.rtw_write16(REG_RXFLTMAP0, 0xFFFF);
+    _device.rtw_write16(REG_RXFLTMAP2, 0xFFFF);   // keep accepting all data-frame subtypes
+    // RXFLTMAP1: accept BAR (subtype 8) + BA (subtype 9) + PS-Poll (subtype 10).
+    _device.rtw_write16(REG_RXFLTMAP1, BIT8 | BIT9 | BIT10);  // BAR + BA + PS-Poll
+  }
   // Read REG_RCR back to PROVE the filter stuck. AAP=1 (promiscuous, sniff the stream) and
   // FORCEACK=1 (HW ACKs frames to our MAC) are both expected now.
   uint32_t rb = _device.rtw_read32(REG_RCR);
