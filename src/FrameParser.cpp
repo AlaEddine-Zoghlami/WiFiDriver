@@ -146,6 +146,9 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
   auto ret = std::vector<Packet>{};
 
   do {
+    // Upstream f58090019: never parse a descriptor out of a tail fragment shorter than
+    // the descriptor itself (the kernel rejects transfers < RXDESC_SIZE before parsing).
+    if (pbuf.size() < RXDESC_SIZE) break;
     auto pattrib = rtl8812_query_rx_desc_status(pbuf.data());
 
     // NOTE: CRC/ICV-bad frames are skipped PER-FRAME below — NOT break'd. The chip packs
@@ -199,7 +202,8 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
         if (GET_RX_STATUS_DESC_PAGGR_8812(pbuf.data())) aggFrames++;
         // RX SNR per path (phystatus rxsnr, dB/2). Marginal SNR at MCS8 -> PER; clean SNR -> the
         // 5-6% retry / 2x gap is NOT reception (front-end PHYDM won't help, it's aggregation).
-        if (pattrib.physt) {
+        if (pattrib.physt && pattrib.drvinfo_sz >= sizeof(_phy_status_rpt_8812) &&
+            pbuf.size() >= RXDESC_SIZE + sizeof(_phy_status_rpt_8812)) {  // upstream f58090019: bound the phy-status read
           const struct _phy_status_rpt_8812* ps =
               reinterpret_cast<const struct _phy_status_rpt_8812*>(pbuf.data() + RXDESC_SIZE);
           snrSumA += ps->rxsnr[0]; snrSumB += ps->rxsnr[1]; snrN++;

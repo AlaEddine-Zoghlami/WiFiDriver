@@ -481,30 +481,31 @@ void EepromManager::LoadTxPowerInfo() {
       BW20_5G_Diff[path][0] = pg_msb_diff(v);
       OFDM_5G_Diff[path][0] = pg_lsb_diff(v);
     }
-    /* Ntx=2..4: 2 bytes each (BW40|BW20, OFDM|-) */
+    /* Ntx=2..4: ONE byte each (MSB=BW40, LSB=BW20). Upstream f58090019: unlike
+     * the 2.4G block, 5G packs the OFDM diffs separately below — the previous
+     * two-bytes-per-Ntx parse reused the 2.4G shape and shifted every field from
+     * byte 16 onward (kernel hal_load_pg_txpwr_info_path_5g, hal_com_phycfg.c). */
     for (int t = 1; t < 4; t++) {
       uint8_t v = efuse_eeprom_data[off++];
       BW40_5G_Diff[path][t] = pg_msb_diff(v);
       BW20_5G_Diff[path][t] = pg_lsb_diff(v);
-      v = efuse_eeprom_data[off++];
-      OFDM_5G_Diff[path][t] = pg_msb_diff(v);
-      /* LSB nibble of this byte is unused for 5G (no CCK on 5G). */
     }
-    /* 3 bytes BW80 diffs, Ntx=1..3 stored as nibble pairs:
-     *   byte 0: MSB=Ntx2-BW80, LSB=Ntx1-BW80
-     *   byte 1: MSB=Ntx4-BW80, LSB=Ntx3-BW80
-     *   byte 2: reserved
-     * Upstream uses a different layout per IC; the 8812 path packs as
-     * above per `hal_load_pg_txpwr_info_path_5g`. */
+    /* OFDM diff 2T~3T: one byte (MSB=2T, LSB=3T). */
     {
       uint8_t v = efuse_eeprom_data[off++];
-      BW80_5G_Diff[path][1] = pg_msb_diff(v);
-      BW80_5G_Diff[path][0] = pg_lsb_diff(v);
-      v = efuse_eeprom_data[off++];
-      BW80_5G_Diff[path][3] = pg_msb_diff(v);
-      BW80_5G_Diff[path][2] = pg_lsb_diff(v);
-      /* third byte ignored */
-      off++;
+      OFDM_5G_Diff[path][1] = pg_msb_diff(v);
+      OFDM_5G_Diff[path][2] = pg_lsb_diff(v);
+    }
+    /* OFDM diff 4T: one byte, LSB nibble only. */
+    {
+      uint8_t v = efuse_eeprom_data[off++];
+      OFDM_5G_Diff[path][3] = pg_lsb_diff(v);
+    }
+    /* BW80|BW160 diffs: four bytes, tx 0..3 (MSB=BW80, LSB=BW160 — no 160MHz
+     * support here, the LSB nibble is consumed for layout only). */
+    for (int t = 0; t < 4; t++) {
+      uint8_t v = efuse_eeprom_data[off++];
+      BW80_5G_Diff[path][t] = pg_msb_diff(v);
     }
   }
 
@@ -779,24 +780,29 @@ uint8_t EepromManager::GetTxPowerIndexBase(uint8_t path, uint8_t rate,
     }
     /* MCS / VHT — pick BW20 / BW40 (BW80 falls through to BW40 per upstream
      * comment "Willis suggest adopt BW 40M power index while in BW 80 mode"). */
-    if (bandwidth == 0) { /* BW20 */
-      if (is_mcs0_7  (rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
-          is_vht3ss  (rate) || is_vht4ss(rate)) txPower += BW20_24G_Diff[path][0];
-      if (is_mcs8_15 (rate) || (ntx_idx >= 1 && (is_vht2ss(rate) || is_vht3ss(rate) || is_vht4ss(rate))))
-        txPower += BW20_24G_Diff[path][1];
-      if (is_mcs16_23(rate) || (ntx_idx >= 2 && (is_vht3ss(rate) || is_vht4ss(rate))))
-        txPower += BW20_24G_Diff[path][2];
-      if (is_mcs24_31(rate) || (ntx_idx >= 3 && is_vht4ss(rate)))
-        txPower += BW20_24G_Diff[path][3];
-    } else { /* BW40 or BW80 */
-      if (is_mcs0_7  (rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
-          is_vht3ss  (rate) || is_vht4ss(rate)) txPower += BW40_24G_Diff[path][0];
-      if (is_mcs8_15 (rate) || (ntx_idx >= 1 && (is_vht2ss(rate) || is_vht3ss(rate) || is_vht4ss(rate))))
-        txPower += BW40_24G_Diff[path][1];
-      if (is_mcs16_23(rate) || (ntx_idx >= 2 && (is_vht3ss(rate) || is_vht4ss(rate))))
-        txPower += BW40_24G_Diff[path][2];
-      if (is_mcs24_31(rate) || (ntx_idx >= 3 && is_vht4ss(rate)))
-        txPower += BW40_24G_Diff[path][3];
+    /* Upstream f58090019: accumulation is CUMULATIVE over rate ranges (kernel
+     * hal_com_phycfg.c): MCS8-31 adds [0]+[1], MCS16-31 adds [0]+[1]+[2], VHT2SS+
+     * adds [1], etc. The old exclusive windows gave e.g. MCS16-23 only [2]. */
+    {
+      const bool ge_1s = is_mcs0_7(rate) || is_mcs8_15(rate) || is_mcs16_23(rate) ||
+                         is_mcs24_31(rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
+                         is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_2s = is_mcs8_15(rate) || is_mcs16_23(rate) || is_mcs24_31(rate) ||
+                         is_vht2ss(rate) || is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_3s = is_mcs16_23(rate) || is_mcs24_31(rate) ||
+                         is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_4s = is_mcs24_31(rate) || is_vht4ss(rate);
+      if (bandwidth == 0) { /* BW20 */
+        if (ge_1s) txPower += BW20_24G_Diff[path][0];
+        if (ge_2s) txPower += BW20_24G_Diff[path][1];
+        if (ge_3s) txPower += BW20_24G_Diff[path][2];
+        if (ge_4s) txPower += BW20_24G_Diff[path][3];
+      } else { /* BW40 or BW80 (BW80 adopts BW40 index) */
+        if (ge_1s) txPower += BW40_24G_Diff[path][0];
+        if (ge_2s) txPower += BW40_24G_Diff[path][1];
+        if (ge_3s) txPower += BW40_24G_Diff[path][2];
+        if (ge_4s) txPower += BW40_24G_Diff[path][3];
+      }
     }
   } else {
     /* 5G — no CCK */
@@ -810,25 +816,34 @@ uint8_t EepromManager::GetTxPowerIndexBase(uint8_t path, uint8_t rate,
       if (ntx_idx >= 3) txPower += OFDM_5G_Diff[path][3];
       goto clamp_and_return;
     }
-    /* MCS / VHT BW20 / BW40 / BW80. */
-    if (bandwidth == 0) {
-      if (is_mcs0_7  (rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
-          is_vht3ss  (rate) || is_vht4ss(rate)) txPower += BW20_5G_Diff[path][0];
-      if (is_mcs8_15 (rate)) txPower += BW20_5G_Diff[path][1];
-      if (is_mcs16_23(rate)) txPower += BW20_5G_Diff[path][2];
-      if (is_mcs24_31(rate)) txPower += BW20_5G_Diff[path][3];
-    } else if (bandwidth == 1) {
-      if (is_mcs0_7  (rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
-          is_vht3ss  (rate) || is_vht4ss(rate)) txPower += BW40_5G_Diff[path][0];
-      if (is_mcs8_15 (rate)) txPower += BW40_5G_Diff[path][1];
-      if (is_mcs16_23(rate)) txPower += BW40_5G_Diff[path][2];
-      if (is_mcs24_31(rate)) txPower += BW40_5G_Diff[path][3];
-    } else { /* BW80 */
-      if (is_mcs0_7  (rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
-          is_vht3ss  (rate) || is_vht4ss(rate)) txPower += BW80_5G_Diff[path][0];
-      if (is_mcs8_15 (rate)) txPower += BW80_5G_Diff[path][1];
-      if (is_mcs16_23(rate)) txPower += BW80_5G_Diff[path][2];
-      if (is_mcs24_31(rate)) txPower += BW80_5G_Diff[path][3];
+    /* MCS / VHT BW20 / BW40 / BW80 — cumulative over rate ranges (upstream
+     * f58090019, kernel hal_com_phycfg.c:2550-2601). The old code had NO VHT
+     * clauses beyond [0] on 5G, so VHT2SS missed [1] and VHT3SS missed [1]+[2]. */
+    {
+      const bool ge_1s = is_mcs0_7(rate) || is_mcs8_15(rate) || is_mcs16_23(rate) ||
+                         is_mcs24_31(rate) || is_vht1ss(rate) || is_vht2ss(rate) ||
+                         is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_2s = is_mcs8_15(rate) || is_mcs16_23(rate) || is_mcs24_31(rate) ||
+                         is_vht2ss(rate) || is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_3s = is_mcs16_23(rate) || is_mcs24_31(rate) ||
+                         is_vht3ss(rate) || is_vht4ss(rate);
+      const bool ge_4s = is_mcs24_31(rate) || is_vht4ss(rate);
+      if (bandwidth == 0) {
+        if (ge_1s) txPower += BW20_5G_Diff[path][0];
+        if (ge_2s) txPower += BW20_5G_Diff[path][1];
+        if (ge_3s) txPower += BW20_5G_Diff[path][2];
+        if (ge_4s) txPower += BW20_5G_Diff[path][3];
+      } else if (bandwidth == 1) {
+        if (ge_1s) txPower += BW40_5G_Diff[path][0];
+        if (ge_2s) txPower += BW40_5G_Diff[path][1];
+        if (ge_3s) txPower += BW40_5G_Diff[path][2];
+        if (ge_4s) txPower += BW40_5G_Diff[path][3];
+      } else { /* BW80 */
+        if (ge_1s) txPower += BW80_5G_Diff[path][0];
+        if (ge_2s) txPower += BW80_5G_Diff[path][1];
+        if (ge_3s) txPower += BW80_5G_Diff[path][2];
+        if (ge_4s) txPower += BW80_5G_Diff[path][3];
+      }
     }
   }
 
