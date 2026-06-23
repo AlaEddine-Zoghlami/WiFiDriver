@@ -67,7 +67,8 @@ private:
     // WITHOUT accepting ancient unacked-A-MPDU retransmits — those carry stale RTP seqs that
     // arrive too late to render and only inflate the seq-gap "lost" counter (a 2048 window
     // measured lost=554k vs the strict check's ~12k). 64 is the sweet spot.
-    static constexpr int PN_WIN_WORDS = 1;             // 64 PNs = the BA reorder window
+    static constexpr int PN_WIN_WORDS = 1;             // 64 PNs = the BA reorder window (tuned: wider
+                                                       // accepts ancient AP retransmits -> stale RTP seqs inflate "lost")
     uint64_t _rxPnPair = 0; uint64_t _rxPnGtk[4] = {0,0,0,0};
     uint64_t _rxPnPairWin[PN_WIN_WORDS] = {0};
     uint64_t _rxPnGtkWin[4][PN_WIN_WORDS] = {{0}};

@@ -1,6 +1,7 @@
 // Self-contained AES-128 + CCM (CCMP: M=8, L=2). Public-domain style AES core.
 #include "AesCcm.h"
 #include <cstring>
+#include <cstdlib>   // getenv (DEVOURER_FORCE_SW_AES A/B switch)
 // x86 AES-NI intrinsics (must be included at file scope, NOT inside a namespace).
 // Gives native Windows/Linux x86 hosts the same hardware AES the ARM phone gets
 // from ARM-CE — without it, software AES runs ~8x slower (355us vs ~10us/pkt) and
@@ -8,6 +9,9 @@
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
 #include <immintrin.h>
 #define APFPV_X86_AESNI 1
+#if defined(__GNUC__)
+#include <cpuid.h>   // __get_cpuid — reliable AES-NI detection on mingw/GCC
+#endif
 #endif
 namespace apfpv { namespace crypto {
 
@@ -222,9 +226,21 @@ bool aes_ccm_decrypt_ce(const uint8_t key[16],const uint8_t* nonce,size_t nlen,
                         const uint8_t* aad,size_t aadlen,
                         const uint8_t* ct,size_t ctlen,uint8_t* out){
     if(ctlen<8) return false;
+    // A/B knob: DEVOURER_FORCE_SW_AES=1 forces the software-AES fallback (the pre-fix path)
+    // so the AES-NI win can be measured back-to-back on the same link.
+    static const bool kForceSw = std::getenv("DEVOURER_FORCE_SW_AES") != nullptr;
+    if (kForceSw) return false;
 #if defined(APFPV_X86_AESNI) && defined(__GNUC__)
-    static const bool kHasAesNi = __builtin_cpu_supports("aes");
-    if(!kHasAesNi) return false;   // no AES-NI on this x86 CPU -> SW fallback
+    // Robust AES-NI detection. __builtin_cpu_supports("aes") returns FALSE on mingw when
+    // __cpu_model isn't initialized -> silent software fallback (~290us/pkt) even on a CPU
+    // that HAS AES-NI -> single RX worker CPU-bound at ~39 Mbps. Use CPUID directly:
+    // leaf 1, ECX bit 25 = AES-NI. (This was the APFPV-vs-wfb RX gap: wfb has no CCMP.)
+    static const bool kHasAesNi = [](){
+        unsigned a,b,c,d;
+        if (__get_cpuid(1,&a,&b,&c,&d)) return (c & (1u<<25)) != 0;
+        return false;
+    }();
+    if(!kHasAesNi) return false;   // genuinely no AES-NI -> SW fallback
 #endif
     // TLS cache per worker thread
     static thread_local uint8_t ck[16]={}; static thread_local AesCeKey ce; static thread_local bool ok=false;
