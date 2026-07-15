@@ -913,7 +913,18 @@ void RtlUsbAdapter::setSecCamKey(uint8_t entry, const uint8_t mac[6], uint8_t ke
 }
 
 void RtlUsbAdapter::enableHwSec() {
-  rtw_write16(0x0680, 0x0c01);   // REG_SECCFG: enable HW TX-enc + RX-dec (kernel value)
+  // REG_SECCFG (0x0680): SCR_CHK_KEYID(BIT8)|SCR_RxDecEnable(BIT3)|SCR_TxEncEnable(BIT2).
+  // GROUND TRUTH from the LIVE kernel mac_reg_dump while connected = 0x010c. The prior
+  // 0x0c01 was a BYTE-SWAPPED usbmon misread: it set BIT0 (TxUseDefaultKey) + two undefined
+  // high bits and NEVER set BIT3 (RxDecEnable) — so HW RX-decrypt never actually engaged
+  // (bdecrypted stayed 0, RxDeframe silently fell back to SW). Fixed to the real value.
+  // The kernel does NOT set SCR_SKByA2 (BIT4) because it populates the address-CAM/macid
+  // map so the security CAM is searched by macid. A userspace driver that skips that setup
+  // can instead set SKByA2 to have the HW search the CAM by transmitter address (A2)
+  // directly. DEVOURER_SECCFG=0xNNNN overrides for A/B (e.g. 0x011c = 0x010c|SKByA2).
+  uint16_t v = 0x010c;
+  if (const char* e = std::getenv("DEVOURER_SECCFG")) v = (uint16_t)strtol(e, nullptr, 0);
+  rtw_write16(0x0680, v);
 }
 
 void RtlUsbAdapter::stopAsyncRx() {

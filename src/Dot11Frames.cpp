@@ -135,16 +135,24 @@ std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
     f.push_back(0x00); f.push_back((uint8_t)ssid.size());
     f.insert(f.end(), ssid.begin(), ssid.end());
 
-    // IE: Supported Rates (1) — 1,2,5.5,11,6,9,12,18 Mbps (basic+OFDM)
-    static const uint8_t rates[] = {0x82,0x84,0x8b,0x96,0x0c,0x12,0x18,0x24};
-    f.push_back(0x01); f.push_back(sizeof(rates));
-    f.insert(f.end(), rates, rates+sizeof(rates));
-
-    // IE: Extended Supported Rates (50) — 24/36/48/54 Mbps. The kernel's assoc-req
-    // includes it; some APs reject an assoc-req that advertises an incomplete rate set.
-    static const uint8_t extRates[] = {0x30,0x48,0x60,0x6c};
-    f.push_back(0x32); f.push_back(sizeof(extRates));
-    f.insert(f.end(), extRates, extRates+sizeof(extRates));
+    // IE: Supported Rates (1). On 5GHz, CCK rates (1/2/5.5/11) are INVALID and make the AP
+    // classify us as a legacy/2.4GHz client → conservative HT-1SS rate control (the MCS2 pin).
+    // DEVOURER_OFDM_RATES=1 sends the kernel's exact 5GHz OFDM-only set (6/9/12/18/24/36/48/54,
+    // basic bits on 6/12/24) in a single tag-1 IE with NO Extended-Rates — matching the live
+    // kernel assoc-req byte-for-byte. Default keeps the 2.4GHz-compatible CCK+OFDM split.
+    if (std::getenv("DEVOURER_OFDM_RATES")) {
+        static const uint8_t rates5[] = {0x8c,0x12,0x98,0x24,0xb0,0x48,0x60,0x6c};
+        f.push_back(0x01); f.push_back(sizeof(rates5));
+        f.insert(f.end(), rates5, rates5+sizeof(rates5));
+    } else {
+        static const uint8_t rates[] = {0x82,0x84,0x8b,0x96,0x0c,0x12,0x18,0x24};
+        f.push_back(0x01); f.push_back(sizeof(rates));
+        f.insert(f.end(), rates, rates+sizeof(rates));
+        // IE: Extended Supported Rates (50) — 24/36/48/54 Mbps.
+        static const uint8_t extRates[] = {0x30,0x48,0x60,0x6c};
+        f.push_back(0x32); f.push_back(sizeof(extRates));
+        f.insert(f.end(), extRates, extRates+sizeof(extRates));
+    }
 
     // IE: RSN (48) — WPA2-PSK / CCMP. Required so the AP starts the 4-way HS.
     //   version 1; group=CCMP; pairwise=CCMP; akm=PSK
@@ -171,15 +179,16 @@ std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
         // (16µs) — we advertised 16µs spacing, which makes the AP pad/cap A-MPDUs to us and holds
         // throughput at ~30Mbps. 0x13 = MaxLenExp 3 (64KB) + MinMPDUSpacing 4 (2µs): tighter packing
         // the 8812 RX handles, so the AP can build deep aggregates (the 30→65 lever).
+        // HT capinfo byte0 = 0x2c. NOTE (2026-07-14): the LIVE kernel advertises 0x6e (40MHz=1,
+        // SGI40=1); ours omits both. Advertising kernel-match caps + OMN=40MHz (0x11) + OFDM-only
+        // 5GHz rates was A/B-tested on the 40MHz OpenIPC VTX and did NOT change the AP's rate pin
+        // (still HT-1SS MCS2, no aggregation), so it's NOT the rate-control lever. Left at 0x2c /
+        // OMN 0x12 to avoid regressing 80MHz APs (needs a bandwidth-aware caps rewrite, not a
+        // hardcode). The self-consistency issue is real but orthogonal to the MCS2 pin.
         0x2d,0x1a, 0x2c,0x19,0x13,0xff,0xff,                      // HT Capabilities — A-MPDU density 2µs (was 16µs)
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
         0xbf,0x0c, 0xa2,0x31,0xc0,0x03,0xfa,0xff,0x63,0x03,0xfa,0xff,0x63,0x03,  // VHT Caps (12B)
-        // Operating Mode Notification (VHT Op Mode field). THIS controls the bandwidth the AP
-        // transmits to us. The old value 0x10 = ChannelWidth[1:0]=00 (20MHz!) + RxNSS=2 — i.e. we
-        // were EXPLICITLY telling the AP "send me 20MHz", overriding the VHT-cap 80MHz and capping
-        // every data frame at bw=0 (the 27Mbps ceiling). 0x12 = ChannelWidth[1:0]=10 (80MHz) +
-        // RxNSS=2 (B4). This is THE fix for "AP sends 20MHz not 80MHz".
         0xc7,0x01, 0x12,                                          // Operating Mode Notification: 80MHz, 2SS
         0x7f,0x08, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40        // Extended Capabilities
     };
