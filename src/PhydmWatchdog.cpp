@@ -41,6 +41,7 @@ constexpr auto kTickInterval = std::chrono::seconds(2);
 /* Connected-mode link state (see header). Default monitor mode. */
 std::atomic<bool> PhydmWatchdog::_s_linked{false};
 std::atomic<int> PhydmWatchdog::_s_rssiDbm{-128};
+std::atomic<int> PhydmWatchdog::_s_uplinkRate{-1};
 
 void PhydmWatchdog::SetLinkRssi(int rssi_dbm) {
   _s_rssiDbm.store(rssi_dbm, std::memory_order_relaxed);
@@ -48,6 +49,16 @@ void PhydmWatchdog::SetLinkRssi(int rssi_dbm) {
 }
 void PhydmWatchdog::SetUnlinked() {
   _s_linked.store(false, std::memory_order_relaxed);
+  _s_uplinkRate.store(-1, std::memory_order_relaxed);
+}
+int PhydmWatchdog::RssiDbm() { return _s_rssiDbm.load(std::memory_order_relaxed); }
+
+void PhydmWatchdog::OnUplinkRate(uint8_t rate_idx) {
+  _s_uplinkRate.store((int)rate_idx, std::memory_order_relaxed);
+}
+uint8_t PhydmWatchdog::UplinkRate() {
+  int r = _s_uplinkRate.load(std::memory_order_relaxed);
+  return r < 0 ? 0xff : (uint8_t)r;
 }
 
 /* CFO tracking accumulators (fed per-RX-packet from FrameParser). */

@@ -290,9 +290,24 @@ std::vector<Packet> FrameParser::recvbuf2recvframe(std::span<uint8_t> ptr) {
       /* pkt_rpt_type == TX_REPORT1-CCX, TX_REPORT2-TX RTP,HIS_REPORT-USB HISR
        * RTP */
       if (pattrib.pkt_rpt_type == RX_PACKET_TYPE::C2H_PACKET) {
-        _logger->info("RX USB C2H_PACKET");
-        // rtw_hal_c2h_pkt_pre_hdl(padapter, precvframe.u.hdr.rx_data,
-        // pattrib.pkt_len);
+        // C2H feedback loop: the firmware RA (USE_RATE=0 uplink) reports its selected
+        // TX rate via C2H_RA_RPT (id 0x0C). C2H content = [id][seq][payload]; for RA_RPT
+        // payload[0]=rate (bit7=SGI, [6:0]=rate idx), payload[1]=macid (phydm_rainfo.c:412).
+        // Feed the rate to the watchdog so the station can monitor/confirm the RA is
+        // ramping (not oscillating). The firmware RA is autonomous (TX-status in HW); this
+        // closes the OBSERVABILITY loop + lets us log the live uplink rate.
+        size_t c2hOff = pattrib.shift_sz + pattrib.drvinfo_sz + RXDESC_SIZE;
+        if (c2hOff + 4 <= pbuf.size()) {
+          uint8_t c2h_id = pbuf[c2hOff];
+          if (c2h_id == 0x0C /*C2H_RA_RPT*/) {
+            uint8_t rate = pbuf[c2hOff + 2] & 0x7f;   // payload[0], strip SGI bit7
+            PhydmWatchdog::OnUplinkRate(rate);
+            static uint32_t raRptN = 0;
+            if ((++raRptN % 32) == 1)                 // throttle the log
+              __android_log_print(4, "rxd-ra", "C2H RA-RPT: uplink rate_idx=%u macid=%u",
+                                  (unsigned)rate, (unsigned)pbuf[c2hOff + 3]);
+          }
+        }
       } else if (pattrib.pkt_rpt_type == RX_PACKET_TYPE::HIS_REPORT) {
         _logger->info("RX USB HIS_REPORT");
       }

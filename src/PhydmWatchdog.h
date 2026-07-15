@@ -72,6 +72,15 @@ public:
    * to restore monitor bounds for wfb-ng. */
   static void SetLinkRssi(int rssi_dbm);
   static void SetUnlinked();
+  static int  RssiDbm();   // last RX RSSI in dBm (-128 if never set)
+
+  /* Firmware-RA C2H feedback loop. The firmware RA (USE_RATE=0 uplink) reports its
+   * currently-selected TX rate for a macid via C2H_RA_RPT (id 0x0C): payload[0]=rate
+   * (bit7=SGI, [6:0]=rate index), payload[1]=macid. FrameParser calls OnUplinkRate on
+   * each report so the station can (a) monitor the uplink rate, (b) confirm the RA is
+   * ramping/converged rather than oscillating. Static: one dongle/watchdog per process. */
+  static void    OnUplinkRate(uint8_t rate_idx);
+  static uint8_t UplinkRate();   // last firmware-RA uplink rate index (0xff if none)
 
   /* CFO (carrier-frequency-offset) tracking — port of phydm_cfo_tracking.
    * Fed per-RX-packet from FrameParser with the phystatus path-A/B CFO tail
@@ -150,6 +159,7 @@ private:
    * boundaries; _s_rssiDbm carries the live RX RSSI for the floor. */
   static std::atomic<bool> _s_linked;
   static std::atomic<int> _s_rssiDbm;
+  static std::atomic<int> _s_uplinkRate;   /* firmware-RA C2H-reported uplink rate idx (-1 = none) */
 
   /* CFO tracking state. Accumulators are static (fed from the RX thread via
    * AddCfo); the rest is per-watchdog. */
