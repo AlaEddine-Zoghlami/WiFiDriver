@@ -172,6 +172,12 @@ private:
   uint8_t _crystal_cap = 0;
   uint8_t _crystal_cap_def = 0;
 
+  /* phydm_noisy_detection + phydm_ra_dynamic_retry_count state. Classify the channel noisy from the
+   * FA/CCA ratio (smoothed) and swap the DARFRC retry table (0x430/0x434) — kernel runs per tick. */
+  uint32_t _noisyDecisionSmooth = 0;
+  int _noisyDecision = 0;
+  int _preNoisy = -1;   /* -1 forces the first write */
+
   bool _digInitialised = false;
   uint8_t _cur_ig_value = 0x20;
   uint8_t _dm_dig_max = 0x26;       /* DIG_MAX_COVERAGR */

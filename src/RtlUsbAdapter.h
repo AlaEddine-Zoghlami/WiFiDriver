@@ -80,6 +80,17 @@ public:
   // cal's synchronous control reads (the daemon-vs-direct-call serialization fix).
   std::shared_ptr<std::atomic<bool>> _rxQuiesce;
   void setQuiesceFlag(std::shared_ptr<std::atomic<bool>> q) { _rxQuiesce = std::move(q); }
+  // Fire-and-forget station TX once streaming: the per-TX REG_TXPKT_EMPTY drain poll
+  // in sendStationFrameSync costs ~6ms/call (3x 2ms settle reads). It's a connect-time
+  // diagnostic; during streaming the LQ-feedback loop calls it ~90-100x/s, so the poll
+  // burns ~560ms/s blocking the caller (RX/feedback thread) -> RX starves -> the phone's
+  // decode/render stutters (renderFps collapses to 0 in bursts). ApfpvStation flips this
+  // true on entering Streaming so the drain poll is skipped (send_packet already blocks
+  // on the actual bulk write); kept false during connect where the drain diag matters.
+  // shared_ptr: survives RtlUsbAdapter value-copies (same pattern as _txWaiting).
+  std::shared_ptr<std::atomic<bool>> _txFastPath =
+      std::make_shared<std::atomic<bool>>(false);
+  void setTxFastPath(bool b) { if (_txFastPath) _txFastPath->store(b); }
 private:
 
 public:

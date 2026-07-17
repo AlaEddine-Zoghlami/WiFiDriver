@@ -27,6 +27,7 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <linux/usbdevice_fs.h>
+#include <cerrno>
 #endif
 
 using namespace std::chrono_literals;
@@ -576,7 +577,20 @@ bool RtlUsbAdapter::send_packet(uint8_t *packet, size_t length) {
     bt.timeout = 100;                // ms
     bt.data = packet;
     int r = TEMP_FAILURE_RETRY(::ioctl(_txFd, USBDEVFS_BULK, &bt));
-    if (r < 0) _logger->error("USBDEVFS_BULK OUT failed: {}", r);
+    if (r < 0) {
+      int e = errno;
+      // A STALLED bulk-OUT endpoint (EPIPE) leaves the uplink jammed: the station can no longer
+      // send LQ/keepalive/ACKs, so the AP drops us a few seconds later and the video freezes
+      // (the "~5s then freeze" symptom). Clear the halt on the TX endpoint and retry ONCE so the
+      // uplink self-recovers instead of staying dead. (Timeout/ENODEV fall through — not a stall.)
+      if (e == EPIPE) {
+        unsigned int cep = tx_ep;
+        ::ioctl(_txFd, USBDEVFS_CLEAR_HALT, &cep);
+        r = TEMP_FAILURE_RETRY(::ioctl(_txFd, USBDEVFS_BULK, &bt));
+        if (r >= 0) _logger->info("USBDEVFS_BULK OUT: recovered from EP stall via CLEAR_HALT");
+      }
+      if (r < 0) _logger->error("USBDEVFS_BULK OUT failed: {} (errno={})", r, e);
+    }
     return r >= 0;
   }
 #endif
@@ -1031,6 +1045,13 @@ bool RtlUsbAdapter::sendStationFrameSync(uint8_t *data, size_t len) {
     // left the TX FIFO via REG_TXPKT_EMPTY (0x041A). Logs the drain so a SILENT run is
     // diagnosable — FIFO never empties => chip gated the TX (no radiation, a concurrency/
     // chip problem) vs FIFO drains => frame went out (an RF/AP problem). Bounded ~40ms.
+    // Fire-and-forget once streaming: the drain poll below is a connect-time diagnostic
+    // that costs ~6ms/call; during streaming the LQ loop calls this ~90-100x/s -> ~560ms/s
+    // of blocking that starves RX -> phone decode/render stutters. send_packet already
+    // blocked on the real bulk write, so the frame is on the chip; just return.
+    if (_txFastPath && _txFastPath->load()) {
+      return ok;
+    }
     if (!std::getenv("DEVOURER_TX_BLIND")) {
       uint16_t e0 = 0, e = 0;
       try { e0 = rtw_read16(0x041A); } catch (...) {}

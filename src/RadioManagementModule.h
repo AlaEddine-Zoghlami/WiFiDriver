@@ -145,6 +145,11 @@ class RadioManagementModule {
   bool _needIQK = false;
   ChannelWidth_t _currentChannelBw;
   uint8_t _currentChannel;
+  // Actual channel value last written to RF 0x18 (the CENTER, not the 802.11
+  // primary that _currentChannel is overridden to). Used by the swchnl skip
+  // check so a 40/80->20 MHz change re-tunes the RF instead of staying on the
+  // old center (the ch36->ch38 tuning bug).
+  uint8_t _rfCenterCh = 0;
   BandType current_band_type;
   bool _swChannel = false;
   bool _channelBwInitialized = false;

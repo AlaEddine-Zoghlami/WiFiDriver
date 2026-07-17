@@ -8,8 +8,24 @@
 #include "FrameParser.h"
 #include "StationTxDesc.h"
 #include <cstdlib>
+#if defined(__ANDROID__)
+#include <sys/system_properties.h>
+#endif
 
 namespace apfpv {
+
+// Firmware-RA uplink toggle. ON by default. Disable with DEVOURER_NO_FW_RA (host) or, on Android
+// where env isn't settable, `setprop debug.pixelpilot.fwra 0`. Disabling reverts DATA frames to a
+// fixed low uplink rate → the AP stops aggregating (declines-BA clean path) → no A-MPDU PN-replay
+// loss (smoother for low-bitrate video; loses the VHT throughput headroom).
+static bool fwRaEnabled() {
+    if (std::getenv("DEVOURER_NO_FW_RA") != nullptr) return false;
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.pixelpilot.fwra", v) > 0 && v[0] == '0') return false;
+#endif
+    return true;
+}
 
 void FillStationTxDesc(uint8_t* txdesc, uint16_t payloadLen, uint8_t descOffset,
                        uint8_t macId, StationFrameKind kind, uint8_t rateId, uint8_t txRate) {
@@ -43,7 +59,7 @@ void FillStationTxDesc(uint8_t* txdesc, uint16_t payloadLen, uint8_t descOffset,
     // BlockAck (A-MPDU 99.8%): 22 → 48-53 Mbps (2.2-2.4x), the wall 10+ prior sessions couldn't
     // pass. DEFAULT ON for data; DEVOURER_NO_FW_RA reverts to fixed-rate for A/B / if an AP
     // dislikes it. (HW-decrypt + BA-accept are NOT required — SW decrypt handles the A-MPDU.)
-    bool fwRa = (kind == StationFrameKind::CcmpData) && std::getenv("DEVOURER_NO_FW_RA") == nullptr;
+    bool fwRa = (kind == StationFrameKind::CcmpData) && fwRaEnabled();
     SET_TX_DESC_USE_RATE_8812(txdesc, fwRa ? 0 : 1);
     if (!fwRa) SET_TX_DESC_TX_RATE_8812(txdesc, txRate);
     SET_TX_DESC_RETRY_LIMIT_ENABLE_8812(txdesc, bmc ? 0 : 1);   // no retry for broadcast

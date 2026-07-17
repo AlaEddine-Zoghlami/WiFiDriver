@@ -46,6 +46,10 @@ private:
     int _pmf = 0;                                           // 802.11w mode (RSN caps)
     ChannelWidth_t _connectWidth = CHANNEL_WIDTH_20;        // connect-time bandwidth (20/40), settable
     std::string _scanSsid; ApInfo _scanResult;
+    // Last matched-beacon RSSI (dBm), kept STABLE across the per-channel _scanResult resets so arm()
+    // can feed it to the DIG for anti-saturation. _scanResult.rssi is reset to -127 per channel, so
+    // arm() must NOT read that; it reads this instead. 0 = no beacon heard yet.
+    std::atomic<int> _lastBeaconRssi{0};
     std::mutex  _scanMtx;
 public:
     std::atomic<bool> _alive{true};

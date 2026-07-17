@@ -109,7 +109,19 @@ void PhydmWatchdog::ThreadLoop() {
   auto next_tick = std::chrono::steady_clock::now() + kTickInterval;
   while (!_stop.load()) {
     if (std::chrono::steady_clock::now() >= next_tick) {
-      TickOnce();
+      // rtw_read/rtw_write throw ios_base::failure when a USB register access fails
+      // (dongle unplugged, USB stall, device gone). An uncaught throw here aborts the
+      // whole app. The watchdog is best-effort tuning — on a USB error just stop
+      // ticking; the station supervisor detects the disconnect and drives reconnect.
+      try {
+        TickOnce();
+      } catch (const std::exception& e) {
+        _logger->error("PhydmWatchdog: USB access failed ({}) - stopping watchdog", e.what());
+        break;
+      } catch (...) {
+        _logger->error("PhydmWatchdog: USB access failed - stopping watchdog");
+        break;
+      }
       next_tick = std::chrono::steady_clock::now() + kTickInterval;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -135,6 +147,35 @@ void PhydmWatchdog::TickOnce() {
     _digInitialised = true;
   }
   DigTick(fa.cnt_all);
+
+  /* phydm_noisy_detection + phydm_ra_dynamic_retry_count (port). The kernel classifies the channel
+   * "noisy" from the smoothed FA/CCA ratio and swaps the DARFRC data-rate-fallback-retry table
+   * (REG 0x430/0x434) — noisy => faster fallback. devourer held a static retry table. Runs per tick.
+   * DEVOURER_NO_RAINFO disables. */
+  if (std::getenv("DEVOURER_NO_RAINFO") == nullptr) {
+    uint32_t cca = fa.cnt_cca_all, faAll = fa.cnt_all, score = 0;
+    for (uint32_t i = 0; i <= 16; i++)
+      if ((uint64_t)faAll * 16 >= (uint64_t)cca * (16 - i)) { score = 16 - i; break; }
+    _noisyDecisionSmooth = (_noisyDecisionSmooth >> 1) + (score << 2);
+    uint32_t scoreSmooth = (cca >= 300) ? ((_noisyDecisionSmooth + 3) >> 3) : 0;
+    _noisyDecision = (scoreSmooth >= 3) ? 1 : 0;
+    if (_noisyDecision != _preNoisy) {
+      if (_noisyDecision) { _device.rtw_write32(0x430, 0x0);        _device.rtw_write32(0x434, 0x04030201); }
+      else                { _device.rtw_write32(0x430, 0x01000000); _device.rtw_write32(0x434, 0x06050402); }
+      _preNoisy = _noisyDecision;
+    }
+  }
+
+  /* halrf power-tracking (thermal-meter → TX BB-swing compensation) — port of the kernel's
+   * halrf_watchdog / odm_txpowertracking_callback_thermal_meter, which the kernel runs EVERY 2s.
+   * devourer's PowerTracking8812a port existed but its periodic hook (RadioManagementModule::
+   * TickPwrTrack) was NEVER called — power-tracking only ran at channel-set, so mid-flight thermal
+   * drift (the dongle heats up) went UNcompensated → TX power/BB-swing drift → RX/TX quality decays
+   * over a long flight (a real dynamic gap vs the kernel). Wire it into the 2s tick here.
+   * DEVOURER_NO_PWRTRACK disables for A/B. */
+  if (_radio && std::getenv("DEVOURER_NO_PWRTRACK") == nullptr) {
+    _radio->TickPwrTrack();
+  }
 
   /* CFO tracking (phydm_cfo_tracking port). Opt-in — a wrong crystal cap
    * detunes the radio, so gate it until validated. */
@@ -277,9 +318,21 @@ void PhydmWatchdog::DigTick(uint32_t fa_cnt) {
     _dm_dig_min = 0x20;
     int rssi_val = _s_rssiDbm.load(std::memory_order_relaxed) + 100;
     if (rssi_val < _dm_dig_min) rssi_val = _dm_dig_min;
-    if (rssi_val > _dm_dig_max) rssi_val = _dm_dig_max;
+    // Cap the RSSI-derived IGI FLOOR at the kernel's strong-signal operating point (~0x37). The
+    // dBm+100 map overshoots for a point-blank signal (-20 dBm -> 0x50 -> clamps to the 0x3e max),
+    // which forces the front-end DEAF (RXPKT_NUM=0, no data, DHCP/SSH fail) even though the kernel
+    // runs ~0x37 fine. Capping the FLOOR at 0x38 keeps enough desensitization to kill the close-
+    // range saturation FA storm while still hearing the AP. Ceiling stays 0x3e so a genuine FA
+    // storm can still walk higher; a clean strong signal settles at ~0x38.
+    constexpr int kStrongFloorCap = 0x38;
+    bool strongCapped = (rssi_val > kStrongFloorCap);
+    if (strongCapped) rssi_val = kStrongFloorCap;
     _rx_gain_range_min = static_cast<uint8_t>(rssi_val);
-    _rx_gain_range_max = _dm_dig_max;
+    // For a STRONG signal, PIN the ceiling to the operating point too. Otherwise the FA-driven walk
+    // climbs IGI above the floor (0x38 -> 0x3c -> 0x3e) chasing a spurious close-range false-alarm
+    // count and goes DEAF (RXPKT_NUM=0) — even though 0x38 receives fine (DHCP/assoc succeed there).
+    // Weaker signals keep the full [floor,0x3e] range so the walk can still adapt to real FA.
+    _rx_gain_range_max = strongCapped ? static_cast<uint8_t>(kStrongFloorCap) : _dm_dig_max;
   } else {
     _dm_dig_max = 0x26;
     _dm_dig_min = 0x1c;

@@ -1,4 +1,5 @@
 #include "PowerTracking8812a.h"
+#include <cstdlib>
 
 #include "Hal8812a_TxPwrTrack.h"
 #include "Hal8812PhyReg.h"
@@ -252,6 +253,24 @@ void PowerTracking8812a::TickThermalMeter(BandType band, uint8_t channel) {
         _deltaPowerIndex[1] != _deltaPowerIndexLast[1]) {
       ApplySwingToBb();
     }
+  }
+
+  /* IQK RETRIGGER on thermal drift — the omitted dynamic piece. The kernel's
+   * odm_txpowertracking_callback re-runs IQK when |thermal - thermal_value_iqk| >= threshold_iqk
+   * (IQK_THRESHOLD=8). devourer did IQK at init only, so as the RF drifts with temperature the TX/RX
+   * IQ imbalance goes uncompensated (RX constellation smears → PER rises over a long flight). IQK
+   * needs a clean control path (its loopback contends with the async RX URBs), so pause RX around it.
+   * Gated DEVOURER_PWRTRACK_IQK (opt-in): the pause is a brief RX blip, and it only fires on a real
+   * >=8-step temperature change (rare), but keep it opt-in until validated on a hot flight. */
+  if (_thermalValueIqk == 0) _thermalValueIqk = avg;  // seed on first tick
+  uint8_t delta_iqk = (avg > _thermalValueIqk) ? (uint8_t)(avg - _thermalValueIqk)
+                                               : (uint8_t)(_thermalValueIqk - avg);
+  if (delta_iqk >= 8 && std::getenv("DEVOURER_PWRTRACK_IQK") != nullptr) {
+    _logger->info("pwrtrk: delta_iqk={} >= 8 -> re-running IQK (thermal drift)", unsigned(delta_iqk));
+    _device.pauseAsyncRx();      // no-op if async RX not active; drains IN URBs so the IQK loopback is clean
+    _radio->RunIQK();
+    _device.resumeAsyncRx();
+    _thermalValueIqk = avg;
   }
 
   _thermalValue = avg;

@@ -8,6 +8,7 @@
 #include "StationMode.h"
 #include "Dot11Frames.h"
 #include "StationTxDesc.h"
+#include "PhydmWatchdog.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
 #endif
@@ -39,6 +40,26 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
     __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
         "arm ENTRY: current_channel=%d", (int)_rm.current_channel());
 #endif
+    // Desensitize the receiver's DIG for the AP's ACTUAL signal strength BEFORE auth. Until link-up
+    // the DIG sits on monitor bounds [0x1c,0x2a] with the gain near its floor; at close range (a
+    // strong beacon RSSI) that OVERLOADS the front-end -> false-alarm storm (fa>1000) -> the AP's
+    // auth-response is never cleanly demodulated ("NO auth-resp" -> TXFAIL_NoAuth reconnect loop).
+    // Feeding the measured beacon RSSI engages the connected DIG bounds [0x20,0x3e] and snaps IGI to
+    // clamp(rssi+100, 0x20, 0x3e) — e.g. -20 dBm -> 0x3e (fully desensitized) — so a point-blank AP
+    // can be received. On fail/disconnect the supervisor restores monitor mode via SetUnlinked().
+    {
+        int apRssi = _lastBeaconRssi.load();   // stable last-heard beacon RSSI (NOT _scanResult, reset per-channel)
+        if (apRssi < 0) {
+            // SetLinkRssi internally caps the derived IGI at the kernel's operating point (~0x37) so
+            // a point-blank signal desensitizes enough to kill the saturation false-alarm storm
+            // without going deaf (feeding raw -20 dBm would snap IGI to the 0x3e max = no RX).
+            PhydmWatchdog::SetLinkRssi(apRssi);
+#if defined(__ANDROID__)
+            __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
+                "arm: DIG desensitize for beacon RSSI=%ddBm (anti-saturation, IGI capped ~0x37)", apRssi);
+#endif
+        }
+    }
     // (0) **SEQUENCE FIX — IQK on the OPERATING channel.** Faithful to the kernel
     // join order (rtw_mlme_ext.c join_cmd_hdl): HW_VAR_DO_IQK(TRUE) -> set_channel_
     // bwmode(final channel) so the IQK runs on the channel we will actually use,
@@ -577,12 +598,18 @@ void StationMode::onScanFrame(const uint8_t* frame, size_t len) {
         if (ScanProbe::parseBeacon(frame, len, ssid, info)) {
             std::lock_guard<std::mutex> lk(_scanMtx);
             if (!_scanResult.found || info.rssi > _scanResult.rssi) _scanResult = info;
+            if (info.rssi > -127) _lastBeaconRssi.store(info.rssi);   // stable across per-channel resets (for arm DIG)
         }
     } catch (...) { /* garbled frame at high rate */ }
 }
 
 ApInfo StationMode::scanForSsid(const char* ssid, int channelHint, int perChannelMs) {
     using namespace std::chrono;
+    // Restore MONITOR-mode DIG bounds (sensitive) for the scan. arm() switches DIG to connected
+    // bounds (desensitized) for the strong-signal auth via SetLinkRssi, and on a FAILED arm the
+    // reconnect loop comes straight back here with _s_linked still TRUE — leaving the scan
+    // desensitized so it can't hear a weaker/normal-range AP -> FAIL_NO_AP loop. Reset each scan.
+    PhydmWatchdog::SetUnlinked();
     { std::lock_guard<std::mutex> lk(_scanMtx); _scanSsid = ssid; _scanResult = ApInfo{}; }
     // Order = likelihood for a LEGAL APFPV link first, then catch-all:
     //   1) hint (the configured/last APFPV channel)

@@ -95,6 +95,7 @@ private:
   uint8_t _defaultOfdmIndex = 24; /* 0 dB; reseeded by Init() */
 
   uint8_t _thermalValue = 0; /* last avg after compute */
+  uint8_t _thermalValueIqk = 0; /* thermal at last IQK — retrigger IQK when |avg-this|>=threshold */
   uint8_t _thermalValueAvgIndex = 0;
   uint8_t _thermalValueAvg[kAvgThermalNum]{};
 

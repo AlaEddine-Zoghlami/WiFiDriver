@@ -7,11 +7,13 @@ extern "C" {
 }
 
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 #if defined(__ANDROID__)
+#include <sys/system_properties.h>
 #include <android/log.h>
 #endif
 
@@ -202,13 +204,28 @@ void RadioManagementModule::SetStationRxFilter() {
           // saw NO ack → retransmitted each frame to the retry limit (~5×), the measured
           // retransmit storm that collapsed paced throughput. Match the kernel.
           RCR_VHT_DACK;
-    // "Keep the frames for the HW": the live kernel RCR (0xf40060ce) also sets
-    // RCR_APP_MIC (BIT30) + RCR_APP_ICV (BIT29) — the MAC RETAINS the MIC/ICV at the
-    // bottom of each RX'd frame instead of stripping them. We were stripping (0x940060ce).
-    // Test whether the HW's station RX engine / BA-arming needs the frame kept intact.
-    // Opt-in (DEVOURER_RCR_APP) since retaining ICV/MIC may add trailing bytes our SW-CCMP
-    // path must tolerate; default off to avoid breaking decrypt.
-    if (std::getenv("DEVOURER_RCR_APP")) rcr |= (1u << 30) | (1u << 29);
+    // RCR_APP_MIC (BIT30) + RCR_APP_ICV (BIT29) — the MAC RETAINS the CCMP MIC/ICV at the bottom of
+    // each RX frame (matches the live kernel RCR 0xf40060ce). DEFAULT ON, and REQUIRED whenever HW
+    // decrypt is on: RxDeframe's HW-decrypt path strips CCMP-hdr(8)+MIC(8)=16 bytes, which is only
+    // correct if the HW kept the MIC. Without this, the HW strips the MIC itself → the -16 eats 8
+    // bytes of real PAYLOAD off every frame → corrupt H.265 NALUs → BLACK SCREEN (bytes still
+    // "flow", so goodput/decFail look fine — this bit us on the phone). DEVOURER_NO_RCR_APP reverts.
+    // DEFAULT OFF (only needed for the HW-decrypt -16 strip, which is now opt-in). Retaining
+    // MIC/ICV changes the trailing-byte layout the SW-CCMP path expects; keep it off for the
+    // proven SW path. Opt in with DEVOURER_RCR_APP when testing HW decrypt.
+    // RCR_APP is REQUIRED whenever HW-decrypt is on (the -16 strip). Auto-enable it with HW-decrypt
+    // so the phone can't run HW-decrypt without it (= the black-screen bug). Env or props.
+    bool rcrApp = std::getenv("DEVOURER_RCR_APP") != nullptr
+               || std::getenv("DEVOURER_HW_DECRYPT") != nullptr;
+#if defined(__ANDROID__)
+    if (!rcrApp) {
+        char v[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("debug.pixelpilot.rcrapp", v) > 0 && v[0] != '0') rcrApp = true;
+        char h[PROP_VALUE_MAX] = {0};
+        if (__system_property_get("debug.pixelpilot.hwdec", h) > 0 && h[0] != '0') rcrApp = true;
+    }
+#endif
+    if (rcrApp) rcr |= (1u << 30) | (1u << 29);
   }
   hw_var_rcr_config(rcr);
   // TEST 2 (DEVOURER_T2_KFLT): match the kernel's RX filter EXACTLY. The kernel leaves RXFLTMAP0
@@ -332,10 +349,13 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
 
   rtw_hal_set_chnl_bw(center_ch, bwmode, offset40,
                       chnl_offset80); /* set center channel */
-  // _currentChannel gets set to CenterFrequencyIndex1 (= center_ch) by
-  // PHY_HandleSwChnlAndSetBW8812. Override to the PRIMARY channel so
-  // current_channel() returns the correct 802.11 primary, not the center.
-  if (channel != center_ch) _currentChannel = channel;
+  // current_channel() must return the 802.11 PRIMARY. PHY_HandleSwChnlAndSetBW8812
+  // only writes _currentChannel inside the _swChannel branch; with the _rfCenterCh
+  // skip-check a same-center re-tune is skipped, which would leave _currentChannel
+  // STALE (reads 0 -> arm tunes ch0 -> Error -> black screen). phy_SwChnl8812 already
+  // ran (and used the center) DURING rtw_hal_set_chnl_bw above, so it is safe to
+  // overwrite the primary here UNCONDITIONALLY.
+  _currentChannel = channel;
 #if defined(__ANDROID__)
   // Verify actual bandwidth by reading the RF synthesizer and BW registers.
   // BB 0x834[1:0]=0(20MHz),1(40MHz),2(80MHz). Also read CCK/OFDM indicator.
@@ -379,9 +399,15 @@ void RadioManagementModule::PHY_HandleSwChnlAndSetBW8812(
     return;
   }
 
-  /* skip change for channel or bandwidth is the same */
+  /* skip change for channel or bandwidth is the same. Compare against the
+   * actual RF-tuned center (_rfCenterCh), NOT _currentChannel: the latter is
+   * overridden to the 802.11 PRIMARY in set_channel_bwmode(), so after a
+   * 40/80 MHz set (RF parked at the center, e.g. ch36@40MHz -> center 38) a
+   * following 20 MHz set of the primary (ch36) would falsely match ChannelNum
+   * and skip the re-tune, leaving the RF on the old center 38. That is the
+   * "ch36 scan actually listens on ch38 -> can't find the AP" bug. */
   if (bSwitchChannel) {
-    if (_currentChannel != ChannelNum) {
+    if (_rfCenterCh != ChannelNum) {
       _swChannel = true;
     }
   }
@@ -407,6 +433,7 @@ void RadioManagementModule::PHY_HandleSwChnlAndSetBW8812(
   if (_swChannel) {
     _currentChannel = ChannelNum;
     _currentCenterFrequencyIndex = ChannelNum;
+    _rfCenterCh = ChannelNum;   // the value phy_SwChnl8812 writes to RF 0x18 = the actual tune
   }
 
   if (_setChannelBw) {
