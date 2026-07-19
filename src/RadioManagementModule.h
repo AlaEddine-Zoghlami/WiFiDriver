@@ -150,6 +150,15 @@ class RadioManagementModule {
   // check so a 40/80->20 MHz change re-tunes the RF instead of staying on the
   // old center (the ch36->ch38 tuning bug).
   uint8_t _rfCenterCh = 0;
+  // Last value read back from RF 0x18 low byte in the RF VERIFY (Android). 0xea =
+  // the RF synthesizer is wedged (won't tune to ANY channel). Used by rf_wedged().
+  uint32_t _lastRfCh = 0;
+  // When true, set_channel_bwmode skips IQK. The scan sweep hops fast across
+  // channels AND bands; a band change arms _needIQK, and running IQK on a fast
+  // unsettled retune wedges the RF synth (RF_CH=0xea) for the rest of the sweep
+  // -> found=0. Listening for beacons needs no TX calibration, so IQK is
+  // suppressed during scan and runs only on the final (settled) arm channel.
+  bool _scanMode = false;
   BandType current_band_type;
   bool _swChannel = false;
   bool _channelBwInitialized = false;
@@ -194,6 +203,13 @@ public:
    * Used by StationMode to pick a band-correct mgmt TX rate: 5 GHz (ch>14)
    * has no CCK, so auth/assoc must go at OFDM, like the kernel. */
   uint8_t current_channel() const { return _currentChannel; }
+  /* True when the RF synthesizer is wedged (RF 0x18 low byte reads 0xea after a
+   * tune) — it won't lock to any channel until a USB port reset. Only meaningful
+   * after a set_channel_bwmode on Android (where the RF VERIFY read runs). */
+  bool rf_wedged() const { return (_lastRfCh & 0xFF) == 0xea; }
+  /* Suppress IQK during the scan sweep (see _scanMode). Set true around the
+   * channel-hop loop, false before arming the real operating channel. */
+  void setScanMode(bool s) { _scanMode = s; }
   /* HT40 prime-channel offset for `channel` (LOWER if the primary sits below the
    * 40 MHz pair's center, UPPER if above, DONT_CARE if the channel has no 40 MHz
    * pairing). REQUIRED when tuning CHANNEL_WIDTH_40: offset 0 (DONT_CARE) leaves

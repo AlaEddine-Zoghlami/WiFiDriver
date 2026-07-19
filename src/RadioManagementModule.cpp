@@ -362,6 +362,7 @@ void RadioManagementModule::set_channel_bwmode(uint8_t channel,
   { uint32_t bb834 = phy_query_bb_reg(0x0834, 0x00000003);
     // Read RF channel from analog register to verify primary channel
     uint32_t rf_ch = phy_query_rf_reg(RfPath::RF_PATH_A, 0x18, 0x000000FF);
+    _lastRfCh = rf_ch;   // for rf_wedged() — 0xea = RF synth locked up
     __android_log_print(ANDROID_LOG_INFO, "apfpv-scan",
         "RF VERIFY: wanted primary=%d off=%d bw=%s center=%d | BB834[1:0]=%d RF_CH=0x%x",
         (int)channel, (int)channel_offset,
@@ -599,11 +600,26 @@ void RadioManagementModule::phy_SwChnlAndSetBwMode8812() {
    * BEFORE running the IQK/LCK. The kernel runs cal once in a settled post-hal_init
    * state; the devourer runs it per-arm right after retuning, so an unsettled PLL can
    * make the cal converge only intermittently (~1/5 of runs radiate). */
-  if (const char* e = std::getenv("DEVOURER_RF_SETTLE_MS"))
-    std::this_thread::sleep_for(std::chrono::milliseconds(std::atoi(e)));
+  // IQK is NEEDED for correct TX at each bandwidth/center (uses different LNA/RFE paths
+  // per band+channel). Suppressed ONLY during scan hops (_scanMode) where band-crossing
+  // IQK on a fast unsettled retune wedges the synth (RF_CH=0xea). On the arm, the channel
+  // is settled for 50+ ms before IQK runs, which converges reliably. DEVOURER_DISABLE_IQK
+  // or DEVOURER_ENABLE_IQK (explicit opt-in) override.
+  bool willIqk = (_needIQK || std::getenv("DEVOURER_ENABLE_IQK")) &&
+                 !std::getenv("DEVOURER_DISABLE_IQK") &&
+                 !_scanMode;
+  if (!willIqk) _needIQK = false;
+  // Settle the RF PLL/analog BEFORE the IQK. Run right after a retune it converges only ~1/5 of
+  // the time (esp. at the 40 MHz center like 38); a non-converged IQK wedges the RF (RF_CH reads
+  // 0xea) -> auth-req TX fails -> arm Error -> reconnect loop. DEFAULT 50 ms now (was 0) so the
+  // IQK converges every arm. Env DEVOURER_RF_SETTLE_MS overrides.
+  if (willIqk) {
+    int settle = 50;
+    if (const char* e = std::getenv("DEVOURER_RF_SETTLE_MS")) settle = std::atoi(e);
+    if (settle > 0) std::this_thread::sleep_for(std::chrono::milliseconds(settle));
+  }
   bool didIQK = false;
-  if ((_needIQK || std::getenv("DEVOURER_FORCE_IQK")) &&
-      !std::getenv("DEVOURER_DISABLE_IQK")) {
+  if (willIqk) {
     if (_eepromManager->version_id.ICType == CHIP_8812) {
       _iqk.Calibrate(_currentChannel, current_band_type,
                      /*is_recovery=*/false);
@@ -620,11 +636,11 @@ void RadioManagementModule::phy_SwChnlAndSetBwMode8812() {
    * LCK the RF synthesizer/PA can be mistuned for transmit (RX still works off a
    * strong beacon) — a candidate for the auth-never-reaches-AP symptom. Run it
    * right after the IQK, matching the kernel's calibration order. */
+  // LCK is REQUIRED for TX radiation (A/B: LCK-OFF never reaches Associating) but should
+  // run alongside the IQK, matching the kernel's calibration order. Gate on didIQK as in
+  // v0.3.8 (the proven working baseline) — IQK writes TX-IQC registers that LCK depends on.
   if (didIQK && !std::getenv("DEVOURER_SKIP_LCK")) {
-    // A/B test proved the LC/VCO cal is NECESSARY for TX radiation (LCK-OFF never
-    // reaches Associating) but it converges intermittently (~1/3 with it) — the per-arm
-    // radiate/silent flicker. Run it N times so a non-locked VCO gets another attempt.
-    int n = 1;   // LCK confirmed necessary (A/B); repeating it is inconclusive + slow.
+    int n = 1;
     if (const char* e = std::getenv("DEVOURER_LCK_N")) n = std::atoi(e);
     for (int k = 0; k < n; ++k) phy_lc_calibrate_8812a();
   }
@@ -1773,6 +1789,15 @@ void RadioManagementModule::phy_PostSetBwMode8812() {
 
   reg_837 = _device.rtw_read8(rBWIndication_Jaguar + 3);
   /* 3 Set Reg848 Reg864 Reg8AC Reg8C4 RegA00 */
+  // ⭐ rBWIndication (BB 0x834[1:0]): the BB bandwidth must match the RF bandwidth.
+  // It was ONLY written by PHY_SwitchWirelessBand8812 (5GHz→0x2=80MHz, 2.4GHz→0x1=40MHz)
+  // and never updated by the bandwidth-set path — so at 20/40 MHz on 5 GHz the BB
+  // still thought it was 80 MHz → subcarrier mapping wrong → no RX data (black screen).
+  // Set it NOW for each bandwidth so the BB matches what the RF is actually tuned to.
+  _device.phy_set_bb_reg(rBWIndication_Jaguar, 0x3,
+      _currentChannelBw == CHANNEL_WIDTH_80  ? 2 :
+      _currentChannelBw == CHANNEL_WIDTH_40  ? 1 : 0);
+
   switch (_currentChannelBw) {
   case CHANNEL_WIDTH_20:
     _device.phy_set_bb_reg(rRFMOD_Jaguar, 0x003003C3,

@@ -28,6 +28,9 @@
 #include <unistd.h>
 #include <linux/usbdevice_fs.h>
 #include <cerrno>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#endif
 #endif
 
 using namespace std::chrono_literals;
@@ -579,6 +582,9 @@ bool RtlUsbAdapter::send_packet(uint8_t *packet, size_t length) {
     int r = TEMP_FAILURE_RETRY(::ioctl(_txFd, USBDEVFS_BULK, &bt));
     if (r < 0) {
       int e = errno;
+      __android_log_print(ANDROID_LOG_ERROR, "apfpv-tx",
+          "USBDEVFS_BULK fd=%d ep=0x%02x len=%zu r=%d errno=%d(%s)",
+          _txFd, tx_ep, length, r, e, strerror(e));
       // A STALLED bulk-OUT endpoint (EPIPE) leaves the uplink jammed: the station can no longer
       // send LQ/keepalive/ACKs, so the AP drops us a few seconds later and the video freezes
       // (the "~5s then freeze" symptom). Clear the halt on the TX endpoint and retry ONCE so the
@@ -591,8 +597,19 @@ bool RtlUsbAdapter::send_packet(uint8_t *packet, size_t length) {
       }
       if (r < 0) _logger->error("USBDEVFS_BULK OUT failed: {} (errno={})", r, e);
     }
+    // Success: log the actual transferred bytes vs requested (once every ~20 TX to avoid spam)
+    static int txCount = 0;
+    if (r >= 0 && (++txCount % 20 == 1))
+      __android_log_print(ANDROID_LOG_INFO, "apfpv-tx",
+          "USBDEVFS_BULK OK fd=%d ep=0x%02x req=%zu actual=%d",
+          _txFd, tx_ep, length, r);
     return r >= 0;
   }
+  // Fall through to libusb path when _txFd < 0
+  static bool warnedNoFd = false;
+  if (!warnedNoFd) { warnedNoFd = true;
+    __android_log_print(ANDROID_LOG_WARN, "apfpv-tx",
+        "NO TX FD (_txFd=%d) — falling back to libusb submit", _txFd); }
 #endif
   libusb_fill_bulk_transfer(transfer, _dev_handle, tx_ep, packet, length,
                             transfer_callback, (void *)(_logger.get()),
@@ -614,6 +631,10 @@ bool RtlUsbAdapter::send_packet(uint8_t *packet, size_t length) {
     return true;
   } else {
     _logger->error("Failed to send packet, error code: {}", rc);
+#if defined(__ANDROID__)
+    __android_log_print(ANDROID_LOG_ERROR, "apfpv-tx",
+        "libusb_submit_transfer FAILED rc=%d ep=0x%02x len=%zu", rc, tx_ep, length);
+#endif
     libusb_free_transfer(transfer);
     return false;
   }

@@ -10,6 +10,12 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#if defined(__ANDROID__)
+#include <android/log.h>
+#define WPALOG(...) __android_log_print(ANDROID_LOG_INFO, "apfpv-scan", __VA_ARGS__)
+#else
+#define WPALOG(...) do{}while(0)
+#endif
 #include <android/log.h>
 
 #ifdef _WIN32
@@ -215,7 +221,8 @@ bool Wpa2Supplicant::verifyProtectedMgmt(const uint8_t* frame, size_t len) const
 }
 
 bool Wpa2Supplicant::onEapolKey(const uint8_t* body, size_t len) {
-    if (len < 95) return false;
+    WPALOG("[wpa] onEapolKey len=%zu state=%d", len, (int)_state);
+    if (len < 95) { WPALOG("[wpa] EAPOL too short (len=%zu <95) — dropped", len); return false; }
     // EAPOL anti-replay: the AP's 8-byte replay counter (offset 9) must not go backwards once
     // the handshake is up — rejects replayed EAPOL-Key frames (KRACK-class). Only enforced past
     // Done so a reconnect's fresh (possibly lower) M1 counter is never rejected; begin() resets.
@@ -234,6 +241,7 @@ bool Wpa2Supplicant::onEapolKey(const uint8_t* body, size_t len) {
     const uint8_t* nonce  = body + 17;
     fprintf(stderr, "[wpa] EAPOL-Key rx len=%zu info=0x%04x mic=%d pairwise=%d state=%d\n",
             len, info, (int)hasMic, (int)isPairwise, (int)_state);
+    WPALOG("[wpa] EAPOL-Key info=0x%04x mic=%d pairwise=%d state=%d", info, (int)hasMic, (int)isPairwise, (int)_state);
     switch (_state) {
         case State::WaitMsg1:
             if (!hasMic && isPairwise) {
@@ -241,6 +249,9 @@ bool Wpa2Supplicant::onEapolKey(const uint8_t* body, size_t len) {
                 bool sent = _send(buildMsg2());
                 _state = State::WaitMsg3;
                 fprintf(stderr, "[wpa] M1 -> built+sent M2 (sent=%d) -> WaitMsg3\n", (int)sent);
+                WPALOG("[wpa] M1 rx -> M2 sent=%d -> WaitMsg3", (int)sent);
+            } else {
+                WPALOG("[wpa] WaitMsg1 but frame not M1 (mic=%d pairwise=%d) — ignored", (int)hasMic, (int)isPairwise);
             }
             return false;
         case State::WaitMsg3:
@@ -250,6 +261,7 @@ bool Wpa2Supplicant::onEapolKey(const uint8_t* body, size_t len) {
                 bool sent4 = _send(buildMsg4());
                 _state = State::Done;
                 fprintf(stderr, "[wpa] M3 -> built+sent M4 (sent=%d) -> DONE\n", (int)sent4);
+                WPALOG("[wpa] M3 rx -> M4 sent=%d -> DONE (keys installed)", (int)sent4);
                 return true;
             }
             return false;

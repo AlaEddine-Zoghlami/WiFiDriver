@@ -110,6 +110,12 @@ public:
    * Returns the number of bytes actually transferred, or negative on error. */
   int bulk_send_sync(uint8_t *packet, size_t length, int timeout_ms);
   void bulk_clear_halt(uint8_t ep) { libusb_clear_halt(_dev_handle, ep); }
+  // USB port reset (USBDEVFS_RESET on the wrapped fd on Android). Cycles the
+  // chip's reset the way a physical replug does — the ONLY thing that clears an
+  // RF-synth wedge (RF_CH reads 0xea) once it happens; a full register/firmware
+  // re-init alone does NOT clear it (proven on-device). Returns the libusb code
+  // (0 = ok). After this the caller must re-run Init() to bring the chip back up.
+  int reset_device() { return libusb_reset_device(_dev_handle); }
   int bulk_send_sync_ep(uint8_t ep, uint8_t *packet, size_t length,
                         int timeout_ms);
   std::vector<Packet> infinite_read();

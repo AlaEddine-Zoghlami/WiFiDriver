@@ -525,8 +525,19 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
                 (int)sent, _dev.rtw_read16(0x0100), _dev.rtw_read8(0x0522), _dev.rtw_read8(0x0808),
                 _dev.rtw_read32(0x0838), rfeA, txX, txY, _dev.rtw_read32(0x0c04));
     } catch (...) { fprintf(stderr, "[auth-tx-rf] register read THREW\n"); }
+    // A single sent=0 (bulk-OUT flicker) used to hard-Error here, killing the arm before the
+    // retransmit loop below ever ran. Instead retry the send a few times immediately; the OUT
+    // path recovers on the next attempt. Only if EVERY attempt fails do we bail (and then as
+    // TXFAIL_NoAuthResp, which the supervisor retries cleanly — not the hard Error that the
+    // scan/arm loop treats as fatal).
+    if (!sent) {
+        for (int i = 0; i < 5 && !sent; ++i) {
+            std::this_thread::sleep_for(milliseconds(60));
+            sent = sendAuthOpenSeq1(self, bssid);
+        }
+        SMLOG("auth-req initial sent=0 -> retried, now sent=%d", sent ? 1 : 0);
+    }
     SMLOG("auth-req tx sent=%d, waiting 3s for auth-resp...", sent ? 1 : 0);
-    if (!sent) return Result::Error;
 
     auto t0 = steady_clock::now();
     auto lastTx = t0;
@@ -536,8 +547,8 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
         // Retransmit the auth like the kernel MLME (it retries ~3x at ~200ms). If our
         // single auth-req flickered off-air on this arm, another frame may radiate and
         // reach the AP. Cheap, kernel-faithful, and directly tests per-frame TX flicker.
-        if (!_gotAuthResp && retx < 5 &&
-            steady_clock::now() - lastTx > milliseconds(350)) {
+        if (!_gotAuthResp && retx < 8 &&
+            steady_clock::now() - lastTx > milliseconds(300)) {
             sendAuthOpenSeq1(self, bssid);
             lastTx = steady_clock::now();
             ++retx;
