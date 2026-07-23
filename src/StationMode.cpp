@@ -438,33 +438,47 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
     // (which runs cal with no userspace RX thread contending). Resume re-arms RX so the
     // auth-response that follows is still caught.
     bool pauseForCal = !std::getenv("DEVOURER_NO_PAUSE_CAL");
-    if (pauseForCal) _dev.pauseAsyncRx();
-    arm(self, bssid);
-    // IQK CONVERGENCE-VERIFIED RETRY: the path-A TX I/Q cal converges only ~2/5 of the
-    // time (worse under USB latency, e.g. a VM's emulated xHCI), and when it falls back
-    // to the IQK-default matrix (TXiqcX=0x200, TXiqcY=0x000) the auth radiates
-    // mis-modulated and the AP can't decode it -> no auth-resp -> stuck Authenticating.
-    // Read the post-cal path-A TX-IQC and re-run the IQK (RX still paused for clean
-    // control I/O) until it converges off the default, up to a bounded number of tries.
-    auto readTxIqcX = [&]() -> uint32_t {
-        try {
-            uint32_t pc = _dev.rtw_read32(0x082c);
-            _dev.rtw_write32(0x082c, pc | 0x80000000u);   // Page C1 -> TX-IQC matrix
-            uint32_t x = _dev.rtw_read32(0x0cd4) & 0x7ff;
-            _dev.rtw_write32(0x082c, pc);
-            return x;
-        } catch (...) { return 0x200; }
-    };
-    int iqkTries = 6;
-    if (const char* e = std::getenv("DEVOURER_IQK_RETRIES")) iqkTries = atoi(e);
-    uint32_t iqcx0 = readTxIqcX();
-    fprintf(stderr, "[iqk-verify] post-arm TXiqcX=0x%03x (0x200=default/not-converged)\n", iqcx0);
-    for (int it = 0; it < iqkTries && readTxIqcX() == 0x200; ++it) {
-        fprintf(stderr, "[iqk-retry] TX-cal did not converge, re-running IQK (try %d)\n", it + 1);
-        try { _rm.RunIQK(); } catch (...) {}
-        fprintf(stderr, "[iqk-retry] -> TXiqcX=0x%03x\n", readTxIqcX());
-    }
-    if (pauseForCal) _dev.resumeAsyncRx();
+    {
+        // RAII, scoped to just the cal: arm()/RunIQK() below do raw register I/O
+        // (rtw_read32/write32) that CAN throw (control-transfer failure, replug mid-cal).
+        // The old code called resumeAsyncRx() only after arm() returned normally, so a
+        // throw left the async RX pool paused AND _rxQuiesce stuck true forever — the next
+        // connect's stopAsyncRx() then waits on an event thread that's permanently yielding
+        // (per pauseAsyncRx's _rxQuiesce contract), times out, and frees URBs libusb still
+        // owns -> UAF/destroyed-mutex SIGABRT. Guarantee resumeAsyncRx() runs on every exit
+        // path instead — scoped to this block so RX resumes here, same as before, not at
+        // runProbe's return (which would leave RX paused through the auth-response wait).
+        struct ResumeGuard {
+            RtlUsbAdapter& dev; bool active;
+            ~ResumeGuard() { if (active) dev.resumeAsyncRx(); }
+        } resumeGuard{_dev, pauseForCal};
+        if (pauseForCal) _dev.pauseAsyncRx();
+        arm(self, bssid);
+        // IQK CONVERGENCE-VERIFIED RETRY: the path-A TX I/Q cal converges only ~2/5 of the
+        // time (worse under USB latency, e.g. a VM's emulated xHCI), and when it falls back
+        // to the IQK-default matrix (TXiqcX=0x200, TXiqcY=0x000) the auth radiates
+        // mis-modulated and the AP can't decode it -> no auth-resp -> stuck Authenticating.
+        // Read the post-cal path-A TX-IQC and re-run the IQK (RX still paused for clean
+        // control I/O) until it converges off the default, up to a bounded number of tries.
+        auto readTxIqcX = [&]() -> uint32_t {
+            try {
+                uint32_t pc = _dev.rtw_read32(0x082c);
+                _dev.rtw_write32(0x082c, pc | 0x80000000u);   // Page C1 -> TX-IQC matrix
+                uint32_t x = _dev.rtw_read32(0x0cd4) & 0x7ff;
+                _dev.rtw_write32(0x082c, pc);
+                return x;
+            } catch (...) { return 0x200; }
+        };
+        int iqkTries = 6;
+        if (const char* e = std::getenv("DEVOURER_IQK_RETRIES")) iqkTries = atoi(e);
+        uint32_t iqcx0 = readTxIqcX();
+        fprintf(stderr, "[iqk-verify] post-arm TXiqcX=0x%03x (0x200=default/not-converged)\n", iqcx0);
+        for (int it = 0; it < iqkTries && readTxIqcX() == 0x200; ++it) {
+            fprintf(stderr, "[iqk-retry] TX-cal did not converge, re-running IQK (try %d)\n", it + 1);
+            try { _rm.RunIQK(); } catch (...) {}
+            fprintf(stderr, "[iqk-retry] -> TXiqcX=0x%03x\n", readTxIqcX());
+        }
+    }  // ResumeGuard fires resumeAsyncRx() here — same position as the original explicit call.
     // ACK-DRIVEN VERIFY: read back the RX-filter state the chip holds after arm(). The auth
     // radiates every run (FIFO=4095) yet the AP reply is missed in silent runs — a raced
     // RCR/MSR/BSSID write would silently drop that reply. Compare silent vs connecting.

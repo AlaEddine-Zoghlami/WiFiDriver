@@ -834,11 +834,30 @@ static void LIBUSB_CALL apfpv_async_rx_cb(libusb_transfer *xfer) {
       st->rxBufs.fetch_add(1);
       st->qCv.notify_one();
       // Swap in a fresh buffer for this transfer before resubmit.
-      // If the free list is empty, we keep the old buffer (graceful degrade).
-      if (!st->freeList.empty()) {
+      // If the free list is empty, we keep the old buffer (graceful degrade) --
+      // meaning this URB gets resubmitted onto the SAME buffer just pushed to
+      // the parse queue above. If the RX worker hasn't parsed it yet when new
+      // data lands, that's a silent overwrite of unprocessed data: a real,
+      // previously-invisible corruption/saturation path. DIAG (was completely
+      // unlogged before): count pool-empty events and periodically report the
+      // free-list depth so a genuine cumulative leak/saturation trend (pool
+      // shrinking over the session, independent of instantaneous bitrate) is
+      // finally visible instead of inferred.
+      static thread_local uint64_t poolEmptyEvents = 0, callsSinceLog = 0;
+      bool poolEmpty = st->freeList.empty();
+      if (poolEmpty) poolEmptyEvents++;
+      if (!poolEmpty) {
         auto* newBuf = st->freeList.back(); st->freeList.pop_back();
         st->transferBuf[idx] = newBuf;
         xfer->buffer = newBuf->data;
+      }
+      if ((++callsSinceLog % 2000) == 0) {
+        size_t qDepth;
+        { std::lock_guard<std::mutex> lk(st->qMtx); qDepth = st->queue.size(); }
+        __android_log_print(poolEmptyEvents ? ANDROID_LOG_WARN : ANDROID_LOG_INFO, "rxd-pool",
+            "freeList=%zu poolEmptyEvents(last2000)=%llu queueDepth=%zu",
+            st->freeList.size(), (unsigned long long) poolEmptyEvents, qDepth);
+        poolEmptyEvents = 0;
       }
     }
   }
@@ -967,8 +986,25 @@ void RtlUsbAdapter::stopAsyncRx() {
   if (!st) return;
   st->running.store(false);
   for (auto *t : st->transfers) libusb_cancel_transfer(t);
-  for (int i = 0; i < 200 && st->inflight.load() > 0; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  // Actively pump events ourselves (same technique as pauseAsyncRx's drain) instead of
+  // sleep-polling and HOPING some other thread (the dedicated libusb event thread in
+  // apfpv_jni.cpp) is scheduled in time and actually pumping. It might not be: if a prior
+  // pauseAsyncRx()/resumeAsyncRx() pair around an arm()/IQK call got unbalanced by an
+  // exception (fixed separately in StationMode::runProbe, but defend here too), the event
+  // thread sits YIELDING on _rxQuiesce forever, cancelled transfers' completions never get
+  // reaped, inflight never reaches 0, the old sleep-wait timed out anyway, and this
+  // function called libusb_free_transfer() on transfers libusb still owned — a
+  // use-after-free that surfaces later as 'pthread_mutex_lock called on a destroyed mutex'
+  // (SIGABRT) whenever anything next touches that context/handle (e.g. libusb_close on a
+  // replug). Pumping here ourselves reaps the cancellations directly, converges reliably,
+  // and works even if the external event thread is stalled.
+  {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    while (st->inflight.load() > 0 && std::chrono::steady_clock::now() < deadline) {
+      if (st->ctx) { struct timeval tv { 0, 5000 }; libusb_handle_events_timeout(st->ctx, &tv); }
+      else std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
   // NOTE: do NOT libusb_clear_halt the bulk-IN endpoint here. On a supervisor
   // RECONNECT, stopAsyncRx runs mid-cycle right before the re-arm; clearing the
   // EP halt then resets USB state so the subsequent auth-req TX drains the FIFO
@@ -982,7 +1018,19 @@ void RtlUsbAdapter::stopAsyncRx() {
   for (auto &w : st->workers) if (w.joinable()) w.join();
   // Return URB buffers back to free list
   for (auto* buf : st->transferBuf) if (buf) st->freeList.push_back(buf);
-  for (auto *t : st->transfers) libusb_free_transfer(t);
+  if (st->inflight.load() > 0) {
+    // Still not reaped after 1s of active pumping — genuinely stuck (e.g. device already
+    // unplugged and no completions will ever arrive). Freeing these would race a kernel/
+    // libusb completion callback that could still land on this memory; leak them instead
+    // (bounded: only happens on the rare stuck case, and the whole context is usually torn
+    // down shortly after anyway) rather than risk the UAF this function used to hit.
+    __android_log_print(ANDROID_LOG_WARN, "RtlUsbAdapter",
+        "stopAsyncRx: %d transfer(s) still in-flight after 1s drain — leaking to avoid UAF",
+        (int) st->inflight.load());
+    // transfers intentionally NOT freed here — see comment above.
+  } else {
+    for (auto *t : st->transfers) libusb_free_transfer(t);
+  }
   _asyncRx.reset();
 }
 
