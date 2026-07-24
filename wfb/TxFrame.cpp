@@ -3,7 +3,7 @@
 #include "sodium/crypto_aead_chacha20poly1305.h"
 #include "sodium/crypto_box.h"
 #include "sodium/randombytes.h"
-#include "src/RtlJaguarDevice.h"
+#include "jaguar1/RtlJaguarDevice.h"
 #include "src/wifibroadcast.hpp"
 #include "src/zfex.h"
 
