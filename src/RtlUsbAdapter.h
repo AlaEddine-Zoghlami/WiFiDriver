@@ -5,6 +5,7 @@
 
 #include <libusb.h>
 #include <thread>
+#include <chrono>
 #include <vector>
 #include <mutex>
 #include <atomic>
@@ -124,15 +125,29 @@ public:
 
   template <typename T> T rtw_read(uint16_t reg_num) {
     T data = 0;
-    if (libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5, reg_num,
-                                0, (uint8_t *)&data, sizeof(T),
-                                USB_TIMEOUT) == sizeof(T)) {
-      return data;
+    // Retry transient USB control-read errors before giving up. A single failed
+    // read used to throw straight to std::terminate (SIGABRT) through the
+    // RtlUsbAdapter ctor -> CreateRtlDevice -> WfbngLink::run JNI thread, killing
+    // the whole app on any USB hiccup (re-open while the dongle is still
+    // settling, or a glitch mid-stream). Timeout/IO/pipe errors are transient
+    // and usually clear on retry; only NO_DEVICE is genuinely unrecoverable.
+    int r = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+      r = libusb_control_transfer(_dev_handle, REALTEK_USB_VENQT_READ, 5,
+                                  reg_num, 0, (uint8_t *)&data, sizeof(T),
+                                  USB_TIMEOUT);
+      if (r == (int)sizeof(T)) {
+        return data;
+      }
+      if (r == LIBUSB_ERROR_NO_DEVICE) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    _logger->error("rtw_read({:04x}), sizeof(T) = {}", reg_num, sizeof(T));
+    _logger->error("rtw_read({:04x}) failed after retries: {} ({}), sizeof(T)={}",
+                   reg_num, r, libusb_error_name(r), sizeof(T));
     throw std::ios_base::failure("rtw_read");
-    return 0;
   }
 
   template <typename T> bool rtw_write(uint16_t reg_num, T value) {
