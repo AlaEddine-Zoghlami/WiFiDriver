@@ -11,6 +11,7 @@
 #include "PhydmWatchdog.h"
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <sys/system_properties.h>
 #endif
 #include "hal_com_reg.h"
 
@@ -30,6 +31,20 @@ namespace apfpv {
 
 static constexpr uint8_t HW_STATE_STATION = 0x02;   // MSR_INFRA
 static constexpr int     TXDESC_8812      = 40;
+
+// Forward decl: the macid our unicast mgmt AND data frames ride (1 on Jaguar). Defined below.
+static uint8_t mgmtMacId();
+// Program the firmware RA peer profile for the DATA macid too, not just macid 0. ON by default;
+// DEVOURER_NO_RA_DATA_MACID (host) or `setprop debug.pixelpilot.ramacid 0` (Android) reverts.
+// See the call site in becomeStation() for why this was the uplink-pinned-at-6Mbps bug.
+static bool raDataMacidEnabled() {
+    if (std::getenv("DEVOURER_NO_RA_DATA_MACID") != nullptr) return false;
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.pixelpilot.ramacid", v) > 0 && v[0] == '0') return false;
+#endif
+    return true;
+}
 
 StationMode::~StationMode() { if (_alivePtr) _alivePtr->store(false); }
 StationMode::StationMode(RtlUsbAdapter& dev, RadioManagementModule& rm, SendFrameFn send)
@@ -203,7 +218,7 @@ void StationMode::arm(const MacAddr& self, const MacAddr& bssid) {
     // that MACID 0 was already a connected peer. DEVOURER_AUTH_STA reverts to the
     // old (pre-auth-H2C) behaviour for A/B.
     if (std::getenv("DEVOURER_AUTH_STA") && !std::getenv("DEVOURER_SKIP_H2C"))
-        sendStationH2C(/*macid=*/0, bssid);
+        sendStationH2C(/*macid=*/0, bssid, _h2cBw);
     _armed = true;
 }
 
@@ -221,7 +236,17 @@ void StationMode::becomeStation(const MacAddr& bssid) {
     // link is choppy. Env-gated for A/B (DEVOURER_NO_STATION_ACK keeps the old monitor RX filter).
     // Windows sequence: H2C 0x34 (FW join) fires BEFORE RCR is set. The firmware
     // needs to enter offload mode before the station RX filter activates.
-    if (!std::getenv("DEVOURER_SKIP_H2C")) sendStationH2C(/*macid=*/0, bssid);
+    if (!std::getenv("DEVOURER_SKIP_H2C")) sendStationH2C(/*macid=*/0, bssid, _h2cBw);
+    // ⭐ ALSO program the RA profile for the macid our DATA frames actually ride. Every CCMP-data
+    // TX path uses macid=1 (macid 0 is special/reserved on Jaguar and drains the FIFO silently —
+    // see the mgmtMacId() note below), but the MACID_CFG/RSSI H2C above only ever configured
+    // macid 0. So under FW_RA (USE_RATE=0) the firmware was asked to rate-adapt a macid with NO
+    // configured peer profile → it falls back to the lowest rate, which is what the AP measures:
+    // rx_bitrate_100kbps=60 (6.0 Mbps), constant across every RSSI. The AP mirrors that onto its
+    // downlink RA → VHT-1SS-MCS1/2, no A-MPDU session → ~20-33 Mbps.
+    // DEVOURER_NO_RA_DATA_MACID / `setprop debug.pixelpilot.ramacid 0` reverts for A/B.
+    if (!std::getenv("DEVOURER_SKIP_H2C") && raDataMacidEnabled())
+        sendStationH2C(/*macid=*/mgmtMacId(), bssid, _h2cBw);
     if (!std::getenv("DEVOURER_NO_STATION_ACK")) _rm.SetStationRxFilter();
     SMLOG("becomeStation: MSR->STATION + connected H2C sent");
 }
@@ -237,7 +262,7 @@ void StationMode::becomeStation(const MacAddr& bssid) {
 //
 // Individual commands are env-gated so each can be isolated on the native probe:
 //   DEVOURER_SKIP_MACIDCFG / DEVOURER_SKIP_MEDIASTATUS / DEVOURER_SKIP_RSSI.
-void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
+void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid, int bw) {
     (void)bssid;
     // H2C_MACID_CFG / PHYDM_H2C_RA_MASK (0x40): rate-adaptation + aggregation config.
     // Kernel PHYDM format (phydm_rainfo.c:phydm_ra_h2c): 7-byte payload with macid,
@@ -283,10 +308,45 @@ void StationMode::sendStationH2C(uint8_t macid, const MacAddr& bssid) {
             macidCfg[3] = (uint8_t)(ra_mask & 0xff); macidCfg[4] = (uint8_t)((ra_mask >> 8) & 0xff);
             macidCfg[5] = (uint8_t)((ra_mask >> 16) & 0xff); macidCfg[6] = (uint8_t)((ra_mask >> 24) & 0xff);
         } else {
-            macidCfg[0] = macid;                                  // macid 0 (AP peer)
-            macidCfg[1] = 0x89;                                   // rate_id=9, init_ra_lv=0, sgi=1
-            macidCfg[2] = 0x1a;                                   // bw80 + VHT + bit3
-            macidCfg[3] = 0x00; macidCfg[4] = 0x80; macidCfg[5] = 0xff; macidCfg[6] = 0xff;  // ra_mask 0xffff8000
+            // ⭐ WIDTH-AWARE. These bytes used to be hardcoded 0x89/0x1a, i.e. rate_id=9
+            // (RATEID_IDX_VHT_2SS) + bw_mode=2 (80 MHz) + vht_en=1 — REGARDLESS of the link's
+            // actual width. That is correct only at 80 MHz. At 20/40 MHz we were telling the
+            // firmware the peer is 80 MHz wide, so our uplink went out VHT80-shaped and the AP
+            // could not decode ANY of it: measured zero packets on the AP's LQ socket
+            // (/proc/net/udp port 12345 rx 0, aalink rssi_udp stuck at its -1 sentinel => OSD
+            // "dn:--"), ARP replies never arrived (neighbour entry INCOMPLETE) and the AP's
+            // driver eventually expired the station for looking dead — while the DOWNLINK
+            // streamed fine. Only 80 MHz ever worked on the dongle path because of this.
+            // Values are from the driver's own enums: RATEID_IDX (include/ieee80211.h)
+            //   BGN_40M_2SS=0, BGN_20M_2SS_BN=2, VHT_2SS=9 (== PHYDM_ARFR0_AC_2SS)
+            // and bw_mode 0=20MHz, 1=40MHz, 2=80MHz. The dongle is 2T2R and advertises 2SS,
+            // so use the 2SS group of the matching PHY. bit3 of byte2 is kept — the live
+            // kernel sets it (0x1a not 0x12) and it was byte-matched from usbmon.
+            {
+                // ONLY bw_mode is width-dependent. The rate GROUP stays VHT-2SS and vht_en stays
+                // 1 at every width: VHT20 and VHT40 are legal and this peer is VHT-capable, so
+                // VHT20 1SS reaches 86.7 Mbps (MCS9) — far above what 20 MHz needs for 38 Mbps.
+                // An earlier revision picked HT groups (RATEID_IDX_BGN_20M_2SS_BN / _40M_2SS)
+                // with vht_en=0 below 80 MHz. That capped the uplink at HT rates, and because
+                // the AP mirrors our uplink rate onto its downlink RA it followed us down —
+                // 20 MHz measured 20.1 Mbps instead of the ~38 it had reached before. The bug
+                // being fixed here was only ever the hardcoded bw_mode=2 (claiming 80 MHz on a
+                // 20/40 MHz link), not the rate group.
+                // MEASURED, not assumed: VHT-2SS (rid=9, vht=1) with bw_mode=0 gave GOODPUT
+                // 0.0 Mbps at 20 MHz -- this AP cannot decode a VHT20 uplink from us. The HT
+                // groups measured 20.1 Mbps on the same link. So the rate GROUP must follow the
+                // width too, not just bw_mode.
+                uint8_t bwm, rid, vht;
+                if (bw >= 80)      { bwm = 2; rid = 9; vht = 1; }  // VHT 2SS @ 80MHz
+                else if (bw >= 40) { bwm = 1; rid = 0; vht = 0; }  // HT40 2SS (RATEID_IDX_BGN_40M_2SS)
+                else               { bwm = 0; rid = 2; vht = 0; }  // HT20 2SS (RATEID_IDX_BGN_20M_2SS_BN)
+                macidCfg[0] = macid;
+                macidCfg[1] = (uint8_t)((rid & 0x1f) | (0 << 5) | (1 << 7));   // init_ra_lv=0, sgi=1
+                macidCfg[2] = (uint8_t)(bwm | (0 << 2) | (vht << 4) | 0x08);   // +bit3 (kernel)
+                macidCfg[3] = 0x00; macidCfg[4] = 0x80; macidCfg[5] = 0xff; macidCfg[6] = 0xff;  // ra_mask 0xffff8000
+                SMLOG("RA H2C: bw=%dMHz -> bw_mode=%u rate_id=%u vht=%u (macidCfg[1]=%02x [2]=%02x)",
+                      (int)bw, bwm, rid, vht, macidCfg[1], macidCfg[2]);
+            }
         }
         h2cRa = _dev.fillH2CCmd(0x40, 7, macidCfg);
     }
@@ -386,7 +446,12 @@ bool StationMode::sendAssocRequest(const MacAddr& self, const MacAddr& bssid, co
     Mac s, b; std::copy(self.b.begin(), self.b.end(), s.begin());
     std::copy(bssid.b.begin(), bssid.b.end(), b.begin());
     uint16_t rsnCaps = (uint16_t)((_pmf >= 1 ? 0x0080 : 0) | (_pmf >= 2 ? 0x0040 : 0)); // MFPC|MFPR
-    auto mpdu = BuildAssocRequest(s, b, std::string(ssid), _pairwise, _group, rsnCaps);
+    // Tell the AP the width we will actually be on, so the Operating Mode Notification stops
+    // claiming 80 MHz at every width. Capability IEs still advertise the chip's full ability, so
+    // the AP can rate-control up to HT 2SS even at 20/40 MHz instead of pinning HT 1SS.
+    const uint8_t operBw = (_connectWidth == CHANNEL_WIDTH_80) ? 2
+                         : (_connectWidth == CHANNEL_WIDTH_40) ? 1 : 0;
+    auto mpdu = BuildAssocRequest(s, b, std::string(ssid), _pairwise, _group, rsnCaps, operBw);
     std::vector<uint8_t> frame(TXDESC_8812 + mpdu.size(), 0);
     std::memcpy(frame.data() + TXDESC_8812, mpdu.data(), mpdu.size());
     FillStationTxDesc(frame.data(), (uint16_t)mpdu.size(), TXDESC_8812,
@@ -599,6 +664,11 @@ StationMode::runProbe(const MacAddr& self, const MacAddr& bssid,
 
     // Associated! NOW become a connected station (MSR->STATION + connected H2C),
     // matching the kernel's post-assoc order. The 4-way handshake + data follow.
+    // Tell the RA H2C the width the radio is ACTUALLY tuned to right now, not a hardcoded
+    // 80 MHz. Getting this wrong shapes our uplink for the wrong bandwidth and the AP cannot
+    // decode any of it (dead LQ/ARP -> station expired). See sendStationH2C's macidCfg build.
+    _h2cBw = (_connectWidth == CHANNEL_WIDTH_80) ? 80
+           : (_connectWidth == CHANNEL_WIDTH_40) ? 40 : 20;
     becomeStation(bssid);
 
     auto h0 = steady_clock::now();

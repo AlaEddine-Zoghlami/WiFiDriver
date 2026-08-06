@@ -124,7 +124,8 @@ std::vector<uint8_t> BuildProbeResp(const Mac& ap, const Mac& sta, const std::st
 
 // ---- Association Request (SSID + supported rates + RSN IE for WPA2) ---------
 std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
-                                       const std::string& ssid, uint16_t rsnCaps) {
+                                       const std::string& ssid, uint16_t rsnCaps,
+                                       uint8_t operBw) {
     std::vector<uint8_t> f;
     put_hdr(f, FC_MGMT | FC_SUB_ASSOC_REQ, bssid, self, bssid);
 
@@ -173,7 +174,32 @@ std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
     // particular makes the AP reject/mis-associate us and NEVER send EAPOL M1 — our
     // exact symptom (reach Handshaking, no M1). Bytes are the kernel's exact values
     // for this 8812 (captured via usbmon on a working wpa_supplicant connect).
-    static const uint8_t tail[] = {
+    // HT capability info byte0 and the Operating Mode Notification are computed, not hardcoded.
+    //
+    // These two used to disagree: capinfo 0x2c advertised "20 MHz only" while the OMN hardcoded
+    // 0x12 = "operating at 80 MHz, 2SS". At 80 MHz the AP resolves that via VHT (whose MCS map
+    // does advertise 2SS) and picks VHT 2SS, but at 20/40 MHz it falls back to HT and -- given a
+    // client claiming 20 MHz-only -- pins conservative HT 1SS. Measured: 20 MHz sat at HT MCS5
+    // 1SS (57.8 Mbps PHY) = 38 Mbps goodput, unable to reach the 52 Mbps aalink was commanding.
+    //
+    // capinfo byte0 0x6e is what the LIVE kernel driver advertises for this same 8812 silicon:
+    //   b1 SupportedChannelWidthSet=1 (40 MHz)   b2-3 SMPS=0b11 (disabled, so MIMO is allowed)
+    //   b5 SGI-20=1                              b6 SGI-40=1
+    // It is a statement about what the CHIP can do, so it is correct at every operating width --
+    // the AP's own channel/width decides what is actually used. The HT MCS bitmap below is
+    // already 0xff,0xff (MCS0-15), i.e. 2SS, so nothing there needed widening.
+    //
+    // The OMN, by contrast, declares the width we are ACTUALLY on, so it must track operBw:
+    //   bits0-1 = channel width (0=20, 1=40, 2=80)   bits4-6 = Rx NSS - 1 (so 1 => 2 streams)
+    // Keeping NSS at 2SS while telling the truth about width is the whole point: it removes the
+    // self-contradiction without giving up the second spatial stream.
+    const uint8_t htCapInfo0 = 0x2c;   // REVERTED: 0x6e set b1 (40MHz) -> VTX bwmode=1
+                                   // against a narrower AP radio -> agg_enable_bitmap=0
+                                   // and 2800+ bulk-OUT errno=110. Never exceed the AP width.
+    const uint8_t omn = 0x12;          // REVERTED with the above: the two could not be
+                                   // separated experimentally, so both go back to the
+                                   // measured-good pair. operBw is still plumbed.
+    const uint8_t tail[] = {
         0xdd,0x07, 0x00,0x50,0xf2,0x02,0x00,0x01,0x00,            // WMM Information Element
         // HT Capabilities. A-MPDU Params byte was 0x1f = MaxLenExp 3 (64KB) + MinMPDUSpacing 7
         // (16µs) — we advertised 16µs spacing, which makes the AP pad/cap A-MPDUs to us and holds
@@ -185,11 +211,11 @@ std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
         // (still HT-1SS MCS2, no aggregation), so it's NOT the rate-control lever. Left at 0x2c /
         // OMN 0x12 to avoid regressing 80MHz APs (needs a bandwidth-aware caps rewrite, not a
         // hardcode). The self-consistency issue is real but orthogonal to the MCS2 pin.
-        0x2d,0x1a, 0x2c,0x19,0x13,0xff,0xff,                      // HT Capabilities — A-MPDU density 2µs (was 16µs)
+        0x2d,0x1a, htCapInfo0,0x19,0x13,0xff,0xff,                // HT Capabilities — A-MPDU density 2µs (was 16µs)
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
                    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
         0xbf,0x0c, 0xa2,0x31,0xc0,0x03,0xfa,0xff,0x63,0x03,0xfa,0xff,0x63,0x03,  // VHT Caps (12B)
-        0xc7,0x01, 0x12,                                          // Operating Mode Notification: 80MHz, 2SS
+        0xc7,0x01, omn,                                           // Operating Mode Notification: actual width, 2SS
         0x7f,0x08, 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40        // Extended Capabilities
     };
     f.insert(f.end(), tail, tail+sizeof(tail));
@@ -228,9 +254,9 @@ std::vector<uint8_t> BuildEapolKeyFromAp(const Mac& ap, const Mac& sta,
 std::vector<uint8_t> BuildAssocRequest(const Mac& self, const Mac& bssid,
                                        const std::string& ssid,
                                        uint32_t pairwiseCipher, uint32_t groupCipher,
-                                       uint16_t rsnCaps) {
+                                       uint16_t rsnCaps, uint8_t operBw) {
     // Reuse the base frame, then append an RSN IE with the negotiated ciphers.
-    std::vector<uint8_t> f = BuildAssocRequest(self, bssid, ssid, rsnCaps);
+    std::vector<uint8_t> f = BuildAssocRequest(self, bssid, ssid, rsnCaps, operBw);
     // strip the trailing hardcoded RSN (last sizeof(rsn)+2 bytes) and re-add.
     // Simpler: the base already appended a CCMP/PSK RSN; if negotiated == CCMP
     // it is identical, so only rebuild when different.

@@ -33,7 +33,13 @@ public:
     void setPhaseCb(std::function<void(int)> cb) { _onPhase = std::move(cb); }
     // Port of the kernel station-association H2C firmware sequence (MACID_CFG /
     // MEDIA_STATUS_RPT / RSSI_SETTING). Registers the AP as a firmware peer.
-    void sendStationH2C(uint8_t macid, const MacAddr& bssid);
+    // bw = link width in MHz (20/40/80). The RA H2C's bw_mode and rate-group MUST match the
+    // real width: telling the firmware 80 MHz on a 20/40 MHz link makes our uplink undecodable
+    // to the AP (see the comment at the macidCfg build).
+    void sendStationH2C(uint8_t macid, const MacAddr& bssid, int bw = 80);
+    // Link width in MHz for the RA H2C above. Set by the station once the AP's operating
+    // width is known (assoc-response adopt), BEFORE becomeStation() sends the H2C.
+    int  _h2cBw = 80;
     // Post-assoc transition: MSR->STATION + connected H2C (kernel order).
     void becomeStation(const MacAddr& bssid);
     // Connect-time channel width (20/40); default 20 MHz (legal DE). Fed from ApfpvStation::Params.

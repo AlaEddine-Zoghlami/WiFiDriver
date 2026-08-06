@@ -27,6 +27,29 @@ static bool fwRaEnabled() {
     return true;
 }
 
+// ARFR rate GROUP for firmware-RA data frames. The CCMP-data TX paths inherit rateId=7 from the
+// mgmt path (RATEID_IDX_G = OFDM-only 6..54M, per the kernel's rtw_get_mgntframe_raid). That is
+// fine while USE_RATE=1 pins an explicit rate, but under FW_RA (USE_RATE=0) the firmware rate-
+// adapts WITHIN the descriptor's group — so a G group can never leave OFDM and parks at the 6M
+// floor. Measured on the VTX AP as rx_bitrate_100kbps=60 (6.0 Mbps) in EVERY sample, identical at
+// rssi 36/38/39/42/45/50 — a constant that ignores signal quality, i.e. a group cap, not a link
+// condition. And because the RTL8812 AP mirrors our uplink rate onto its downlink RA (see the
+// FW_RA note below), that pinned the AP at VHT-1SS-MCS1/2 with NO aggregation
+// (agg_enable_bitmap=0 on the AP) => ~20-33 Mbps instead of the 48-53 the FW_RA work reached.
+// Use PHYDM_ARFR0_AC_2SS = 9: the same group the RA H2C configures (rate_id=9 in
+// StationMode::sendStationH2C) and the one the AP independently reports for us (raid=9).
+// DEVOURER_RA_RAID / `setprop debug.pixelpilot.raraid N` override for A/B (7 = old behaviour).
+static uint8_t fwRaRateId() {
+    if (const char* e = std::getenv("DEVOURER_RA_RAID"))
+        return (uint8_t)std::strtoul(e, nullptr, 0);
+#if defined(__ANDROID__)
+    char v[PROP_VALUE_MAX] = {0};
+    if (__system_property_get("debug.pixelpilot.raraid", v) > 0 && v[0])
+        return (uint8_t)std::strtoul(v, nullptr, 0);
+#endif
+    return 9;   // PHYDM_ARFR0_AC_2SS — VHT 2SS, 5 GHz
+}
+
 void FillStationTxDesc(uint8_t* txdesc, uint16_t payloadLen, uint8_t descOffset,
                        uint8_t macId, StationFrameKind kind, uint8_t rateId, uint8_t txRate) {
     SET_TX_DESC_PKT_SIZE_8812(txdesc, payloadLen);
@@ -48,7 +71,10 @@ void FillStationTxDesc(uint8_t* txdesc, uint16_t payloadLen, uint8_t descOffset,
         (kind == StationFrameKind::Mgmt || kind == StationFrameKind::BroadcastMgmt) ? 0x12 : 0x00);
     SET_TX_DESC_SEC_TYPE_8812(txdesc, 0);            // SW-CCMP / cleartext mgmt
     SET_TX_DESC_HWSEQ_EN_8812(txdesc, 1);
-    SET_TX_DESC_RATE_ID_8812(txdesc, rateId);
+    // fwRa must be known BEFORE RATE_ID: under FW_RA the firmware picks the rate from the
+    // descriptor's ARFR group, so the group itself is part of the lever (see fwRaRateId).
+    bool fwRa = (kind == StationFrameKind::CcmpData) && fwRaEnabled();
+    SET_TX_DESC_RATE_ID_8812(txdesc, fwRa ? fwRaRateId() : rateId);
     // ⭐ Uplink rate control — THE VHT lever (validated on the VM kernel-diff rig 2026-07-14).
     // mgmt/EAPOL/handshake use fixed USE_RATE=1 (reliable — they must not ride an un-converged
     // firmware RA and fail to associate). DATA frames use USE_RATE=0 = firmware rate-adaptation
@@ -59,7 +85,6 @@ void FillStationTxDesc(uint8_t* txdesc, uint16_t payloadLen, uint8_t descOffset,
     // BlockAck (A-MPDU 99.8%): 22 → 48-53 Mbps (2.2-2.4x), the wall 10+ prior sessions couldn't
     // pass. DEFAULT ON for data; DEVOURER_NO_FW_RA reverts to fixed-rate for A/B / if an AP
     // dislikes it. (HW-decrypt + BA-accept are NOT required — SW decrypt handles the A-MPDU.)
-    bool fwRa = (kind == StationFrameKind::CcmpData) && fwRaEnabled();
     SET_TX_DESC_USE_RATE_8812(txdesc, fwRa ? 0 : 1);
     if (!fwRa) SET_TX_DESC_TX_RATE_8812(txdesc, txRate);
     SET_TX_DESC_RETRY_LIMIT_ENABLE_8812(txdesc, bmc ? 0 : 1);   // no retry for broadcast
